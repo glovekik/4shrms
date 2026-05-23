@@ -1,0 +1,30 @@
+# Don't bake the local virtualenv into the image — pip installs fresh
+# inside the container.
+venv/
+.venv/
+
+# Local-only uploads. Production stores files on the Fly Volume mounted
+# at /data/uploads (set via UPLOAD_DIR env).
+uploads/
+
+# Python bytecode cache.
+__pycache__/
+*.pyc
+*.pyo
+
+# Local secrets — Fly uses `fly secrets` instead.
+.env
+.env.local
+
+# Logs and editor state.
+*.log
+.vscode/
+.idea/
+.DS_Store
+
+# Tests + helper scripts that don't need to ship to the server.
+test_*.py
+bootstrap_test_*.py
+
+# Docs (keep the image lean — these stay in the repo).
+*.md

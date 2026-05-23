@@ -1,0 +1,3 @@
+Run time of job "evening_checkout_reminder (trigger: cron[hour='23', minute='0'], next run at: 2026-05-12 23:00:00 IST)" was missed by 11:21:28.251358
+Run time of job "auto_close_attendance (trigger: cron[hour='0', minute='1'], next run at: 2026-05-13 00:01:00 IST)" was missed by 10:20:28.279171
+Run time of job "daily_absent_marker (trigger: cron[hour='0', minute='30'], next run at: 2026-05-13 00:30:00 IST)" was missed by 9:51:28.279821
