@@ -9,9 +9,8 @@ from typing import Optional
 
 from database import db
 from utils.dependencies import get_current_user_doc
-from utils.notify import notify_user
+from utils.notify import notify_user, create_notification
 from utils.push import push_to_users
-from utils.realtime import publish as realtime_publish
 from models.message import MessageCreate
 
 # Two routers, one helper set. Office and team chat are structurally identical
@@ -213,14 +212,18 @@ async def _insert_message(
             except Exception:
                 pass
 
-    # Office chat (company-wide) — push notification + lightweight SSE
-    # tick to every authenticated user except the author and already-
-    # mentioned users. No bell notification row is written (the bell
-    # stays mention-only). The push gives an OS-level alert on real
-    # devices; the SSE tick drives the dashboard chat-unread badge to
-    # refresh live. realtime_publish is a no-op for users with no open
-    # SSE subscriber, so the cost scales with connected users, not
-    # total users in the org.
+    # Every chat message (team + office) fans out a batch push +
+    # one bell-notification row per recipient. Author and already-
+    # mentioned users are skipped to avoid double-notifying. The bell
+    # row is what powers the notifications list; create_notification
+    # also fires a realtime SSE event so the dashboard chat badge and
+    # the bell unread count both update live.
+    #
+    # Watch-out: this design produces N bell rows per message, which
+    # CAN flood the bell for chatty channels. If that becomes a UX
+    # problem, the cleanest next step is a per-channel mute toggle on
+    # the user document plus a "collapse same-channel" rule in the
+    # notifications list — not changing this fan-out.
     if channel_type == "office":
         recipient_ids: list[str] = []
         async for u in db.users.find(
@@ -234,50 +237,28 @@ async def _insert_message(
                 continue
             recipient_ids.append(uid)
 
+        title = f"{author_name} · Office chat"
+        data_payload = {
+            "type": "chat_message",
+            "channelType": "office",
+            "channelId": None,
+            "messageId": str(msg["_id"]),
+            "authorId": user_id,
+        }
+
         if recipient_ids:
             try:
-                await push_to_users(
-                    recipient_ids,
-                    f"{author_name} · Office chat",
-                    snippet,
-                    {
-                        "type": "chat_message",
-                        "channelType": "office",
-                        "channelId": None,
-                        "messageId": str(msg["_id"]),
-                    },
-                )
+                await push_to_users(recipient_ids, title, snippet, data_payload)
             except Exception:
                 pass
+            for rid in recipient_ids:
+                try:
+                    await create_notification(
+                        rid, "chat_message", title, snippet, data_payload,
+                    )
+                except Exception:
+                    pass
 
-        for rid in recipient_ids:
-            try:
-                await realtime_publish(
-                    rid,
-                    {
-                        "type": "notification",
-                        "data": {
-                            "type": "chat_message",
-                            "channelType": "office",
-                            "channelId": None,
-                            "messageId": str(msg["_id"]),
-                            "authorId": user_id,
-                        },
-                    },
-                )
-            except Exception:
-                pass
-
-    # Team messages ping the rest of the team with a PUSH only — they are
-    # deliberately NOT added to the in-app notification bell (chat activity
-    # would flood it; the dashboard Chat tile badge tracks unread instead).
-    # The bell is reserved for @mentions, handled above. Office chat is
-    # company-wide, so it stays mention-only. Mentioned members already got
-    # a full notification above — don't double-notify them here.
-    #
-    # We DO fan out a lightweight realtime "chat_message" event so the
-    # dashboard's Chat tile badge updates live on every connected client
-    # without polling. The event carries no in-app notification row.
     if channel_type == "team" and channel_id:
         try:
             team = await db.teams.find_one({"_id": ObjectId(channel_id)})
@@ -290,38 +271,27 @@ async def _insert_message(
             recipients.discard(user_id)
             recipients.difference_update(resolved_mentions)
             if recipients:
+                title = (
+                    f"{author_name} · "
+                    f"{team.get('name') or 'Team chat'}"
+                )
+                data_payload = {
+                    "type": "chat_message",
+                    "channelType": "team",
+                    "channelId": channel_id,
+                    "messageId": str(msg["_id"]),
+                    "authorId": user_id,
+                }
                 try:
                     await push_to_users(
-                        recipients,
-                        f"{author_name} · {team.get('name') or 'Team chat'}",
-                        snippet,
-                        {
-                            "type": "chat_message",
-                            "channelType": "team",
-                            "channelId": channel_id,
-                            "messageId": str(msg["_id"]),
-                        },
+                        recipients, title, snippet, data_payload,
                     )
                 except Exception:
                     pass
-
-                # Realtime tick — drives the dashboard's chat-unread badge
-                # and lets open chat screens reload without waiting for the
-                # 3s poll. Best-effort.
                 for rid in recipients:
                     try:
-                        await realtime_publish(
-                            rid,
-                            {
-                                "type": "notification",
-                                "data": {
-                                    "type": "chat_message",
-                                    "channelType": "team",
-                                    "channelId": channel_id,
-                                    "messageId": str(msg["_id"]),
-                                    "authorId": user_id,
-                                },
-                            },
+                        await create_notification(
+                            rid, "chat_message", title, snippet, data_payload,
                         )
                     except Exception:
                         pass
