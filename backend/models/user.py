@@ -122,24 +122,25 @@ class StatutoryInfo(BaseModel):
     esiNumber: Optional[str] = None
 
 
-WageType = Literal["Fixed Wage", "Hourly Wage"]
-WageDuration = Literal[
-    "Year", "Half-Year", "Quarter", "2 Months", "Month",
-    "Half-Month", "2 Weeks", "Week", "Day",
-]
-EmployeeType = Literal[
-    "Employee", "Worker", "Student", "Trainee",
-    "Contractor", "Freelancer", "Apprenticeship",
-]
-
-
+# Frontend canonical values:
+#   wageType:      "Fixed Wage" | "Hourly Wage"
+#   wageDuration:  "Year" | "Half-Year" | "Quarter" | "2 Months" | "Month" |
+#                  "Half-Month" | "2 Weeks" | "Week" | "Day"
+#   employeeType:  "Full-time" | "Part-time" | "Internship" | "Contract" |
+#                  "Consultant"
+#
+# Kept as plain Optional[str] (not Literal) on purpose: the previous
+# Literal enum on the backend used "Employee/Worker/Student/Trainee/..."
+# which the UI never sends, so every contract save silently 422'd and
+# the fields appeared blank after refresh. The UI dropdown is now the
+# single source of truth for valid values.
 class ContractOverview(BaseModel):
     contractStartDate: Optional[str] = None  # YYYY-MM-DD
     contractEndDate: Optional[str] = None
-    wageType: Optional[WageType] = None
+    wageType: Optional[str] = None
     wage: Optional[float] = None
-    wageDuration: Optional[WageDuration] = None
-    employeeType: Optional[EmployeeType] = None
+    wageDuration: Optional[str] = None
+    employeeType: Optional[str] = None
 
 
 # ================= Auth models =================
