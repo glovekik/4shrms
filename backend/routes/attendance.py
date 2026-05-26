@@ -187,13 +187,13 @@ async def checkout(
 
     today = data.date
 
-    work_notes = data.workNotes
+    work_notes = (data.workNotes or "").strip()
 
-    if not work_notes.strip():
+    if len(work_notes) < 5:
 
         raise HTTPException(
             status_code=400,
-            detail="Work notes required"
+            detail="Work notes must be at least 5 characters"
         )
 
     existing = await db.attendance.find_one({

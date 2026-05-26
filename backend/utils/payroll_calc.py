@@ -17,6 +17,36 @@ def auto_pf(basic: float) -> float:
     return round(min(basic, PF_BASIC_CAP) * PF_RATE, 2)
 
 
+def breakdown_from_ctc(monthly_ctc: float) -> dict:
+    """Standard breakdown from monthly CTC per company formula.
+
+    Basic 50%, HRA 20%, Communication 5%, Other 19%, Employer PF 6%
+    (capped at ₹1800). PF cap rollover lands in Other Allowance so the
+    parts always sum to CTC.
+    """
+    if monthly_ctc <= 0:
+        return {
+            "basic": 0.0,
+            "hra": 0.0,
+            "communicationAllowance": 0.0,
+            "otherAllowance": 0.0,
+            "employerPF": 0.0,
+        }
+    basic = round(monthly_ctc * 0.5, 2)
+    hra = round(monthly_ctc * 0.2, 2)
+    communication = round(monthly_ctc * 0.05, 2)
+    raw_pf = round(monthly_ctc * 0.06, 2)
+    employer_pf = min(raw_pf, PF_MAX_PER_SIDE)
+    other = round(monthly_ctc - basic - hra - communication - employer_pf, 2)
+    return {
+        "basic": basic,
+        "hra": hra,
+        "communicationAllowance": communication,
+        "otherAllowance": max(0.0, other),
+        "employerPF": employer_pf,
+    }
+
+
 def resolve_structure_amounts(structure: dict) -> dict:
     """Resolve nullable PF fields in a salary structure to concrete amounts.
 

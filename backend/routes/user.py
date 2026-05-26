@@ -217,10 +217,51 @@ async def update_my_profile(
     return {**_serialize_profile(fresh), "updatedFields": changed}
 
 
-# ================= Team-chat unread badge =================
-# The dashboard Chat tile shows a count of unread team-chat messages —
-# team messages newer than the user's last chat-read marker. Office chat
-# is company-wide and intentionally excluded.
+# ================= Profile picture — every user can set their own =================
+# Separate from /me/profile because that endpoint enforces the
+# "blank-only" rule on personal info (HR-set values stay locked). A
+# profile picture is owned by the user — they can replace it freely.
+# Accepting `url: null` clears it (used by the "Remove photo" action).
+class MyProfilePictureUpdate(BaseModel):
+    url: Optional[str] = None
+
+
+@router.put("/me/profile-picture")
+async def update_my_profile_picture(
+    data: MyProfilePictureUpdate,
+    user_id: str = Depends(get_current_user),
+):
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    new_url = (data.url or "").strip() or None
+    await db.users.update_one(
+        {"_id": ObjectId(user_id)},
+        {
+            "$set": {
+                "profilePictureUrl": new_url,
+                "updatedAt": datetime.now(timezone.utc),
+            }
+        },
+    )
+    await log_audit(
+        actor_id=user_id,
+        action="profile.picture_update",
+        entity_type="users",
+        entity_id=user_id,
+        after={"profilePictureUrl": new_url},
+    )
+
+    fresh = await db.users.find_one({"_id": ObjectId(user_id)})
+    return _serialize_profile(fresh)
+
+
+# ================= Chat unread badge =================
+# The dashboard Chat tile shows a count of unread chat messages —
+# anything newer than the user's last chat-read marker, across BOTH
+# office chat (company-wide) and team chats they belong to. Author's
+# own messages are excluded.
 
 @router.get("/me/chat-unread")
 async def my_chat_unread(user_id: str = Depends(get_current_user)):
@@ -234,8 +275,6 @@ async def my_chat_unread(user_id: str = Depends(get_current_user)):
         {"_id": 1},
     ):
         team_ids.append(str(t["_id"]))
-    if not team_ids:
-        return {"count": 0}
 
     since = user.get("chatLastReadAt")
     if since is None:
@@ -243,9 +282,16 @@ async def my_chat_unread(user_id: str = Depends(get_current_user)):
     elif since.tzinfo is None:
         since = since.replace(tzinfo=timezone.utc)
 
+    # Office (company-wide) + the user's team channels.
+    channel_clause: list[dict] = [{"channelType": "office"}]
+    if team_ids:
+        channel_clause.append({
+            "channelType": "team",
+            "channelId": {"$in": team_ids},
+        })
+
     count = await db.chat_messages.count_documents({
-        "channelType": "team",
-        "channelId": {"$in": team_ids},
+        "$or": channel_clause,
         "userId": {"$ne": user_id},
         "createdAt": {"$gt": since},
     })

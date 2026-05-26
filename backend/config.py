@@ -36,11 +36,14 @@ COMPANY_LOGO_PATH = os.getenv(
 
 
 # ================= SMTP =================
-SMTP_HOST = os.getenv("SMTP_HOST", "")
+# Strip whitespace because Gmail app passwords are 16 chars with no spaces
+# and a stray leading/trailing space (easy to introduce when copy-pasting
+# from a .env file or password manager) silently breaks auth.
+SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-SMTP_FROM = os.getenv("SMTP_FROM", "")
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "").strip()
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "").strip()
+SMTP_FROM = os.getenv("SMTP_FROM", "").strip()
 SMTP_USE_TLS = (
     os.getenv("SMTP_USE_TLS", "true").lower() == "true"
 )
