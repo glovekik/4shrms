@@ -213,22 +213,43 @@ async def _insert_message(
             except Exception:
                 pass
 
-    # Office chat (company-wide) — fan out a lightweight SSE tick to
-    # every authenticated user except the author + already-mentioned
-    # users. No notification row is written (the bell stays mention-
-    # only); the tick simply drives the dashboard chat-unread badge to
+    # Office chat (company-wide) — push notification + lightweight SSE
+    # tick to every authenticated user except the author and already-
+    # mentioned users. No bell notification row is written (the bell
+    # stays mention-only). The push gives an OS-level alert on real
+    # devices; the SSE tick drives the dashboard chat-unread badge to
     # refresh live. realtime_publish is a no-op for users with no open
     # SSE subscriber, so the cost scales with connected users, not
     # total users in the org.
     if channel_type == "office":
         recipient_ids: list[str] = []
-        async for u in db.users.find({}, {"_id": 1}):
+        async for u in db.users.find(
+            {"status": {"$ne": "Terminated"}},
+            {"_id": 1},
+        ):
             uid = str(u["_id"])
             if uid == user_id:
                 continue
             if uid in resolved_mentions:
                 continue
             recipient_ids.append(uid)
+
+        if recipient_ids:
+            try:
+                await push_to_users(
+                    recipient_ids,
+                    f"{author_name} · Office chat",
+                    snippet,
+                    {
+                        "type": "chat_message",
+                        "channelType": "office",
+                        "channelId": None,
+                        "messageId": str(msg["_id"]),
+                    },
+                )
+            except Exception:
+                pass
+
         for rid in recipient_ids:
             try:
                 await realtime_publish(
