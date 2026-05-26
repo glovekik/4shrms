@@ -182,6 +182,22 @@ async def on_shutdown():
     stop_scheduler()
 
 
+# ================= HEALTH / ROOT =================
+# Render's deploy probe scans for an open port AND looks for an HTTP
+# response at "/" — without a root route it logs 404 and the load
+# balancer can flag the port as "not really alive". Returning a tiny
+# JSON keeps the deploy healthy and gives a quick "is the service up"
+# endpoint for ops.
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "attendance-api"}
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok"}
+
+
 # ================= CORS =================
 # allow_credentials must be False when allow_origins=["*"]
 # (browsers reject the wildcard with credentials enabled).

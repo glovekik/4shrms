@@ -27,11 +27,16 @@ RUN pip install --no-cache-dir --upgrade pip \
 # __pycache__/, .env out of the build context.
 COPY . .
 
-# Fly's default internal port. fly.toml's [http_service] block maps this.
+# Default port used when no PORT env var is provided (e.g. local docker
+# run). Render and Fly both inject their own PORT at runtime, which the
+# CMD respects via ${PORT}.
 ENV PORT=8080
 EXPOSE 8080
 
-# uvicorn directly (one worker). For multi-worker, switch to gunicorn
-# with uvicorn workers — but a single Fly free-tier VM has 256 MB RAM,
-# which doesn't comfortably fit multiple workers anyway.
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]
+# uvicorn directly (one worker). For multi-worker prod, switch to
+# gunicorn with uvicorn workers — but a single small VM (Fly free,
+# Render starter) has limited RAM, which doesn't fit multiple workers
+# anyway. --proxy-headers + --forwarded-allow-ips lets uvicorn trust
+# the load balancer's X-Forwarded-* headers so client IPs / scheme are
+# correct in logs and middleware.
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080} --proxy-headers --forwarded-allow-ips=*"]
