@@ -116,7 +116,10 @@ from routes.performance import (
     feedback_hr_router,
 )
 
-from routes.uploads import router as uploads_router
+from routes.uploads import (
+    uploads_router,
+    files_router,
+)
 
 from routes.user import router as user_router
 
@@ -663,6 +666,14 @@ app.include_router(
 app.include_router(
     uploads_router,
     prefix="/uploads",
+    tags=["Uploads"],
+)
+# Auth-gated download proxy for files stored in db.uploads. Mounted at
+# /files/{id}; backend reads the row, fetches from the right storage
+# backend (local disk or Drive), and streams.
+app.include_router(
+    files_router,
+    prefix="/files",
     tags=["Uploads"],
 )
 
