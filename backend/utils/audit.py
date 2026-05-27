@@ -11,11 +11,12 @@ from typing import Any, Optional
 from database import db
 
 
-# Audit rows auto-expire after 90 days via a TTL index on `expiresAt`
-# (see database.create_indexes). 3 months is enough for routine
-# investigations; for longer retention we'd archive to cold storage,
-# not bloat Mongo.
-AUDIT_TTL_DAYS = 90
+# Audit rows auto-expire after 2 days via a TTL index on `expiresAt`
+# (see database.create_indexes). Tight retention during the pilot to
+# keep Mongo footprint small. For real compliance / investigation
+# needs (3+ months), bump this back up — recommended values are 90
+# (default) or 365 (annual reviews).
+AUDIT_TTL_DAYS = 2
 
 
 async def log_audit(
