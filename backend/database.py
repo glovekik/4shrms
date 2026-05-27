@@ -219,6 +219,12 @@ async def create_indexes():
         [("entityType", 1), ("entityId", 1), ("at", -1)]
     )
     await db.audit_logs.create_index([("actorId", 1), ("at", -1)])
+    # TTL: rows auto-delete 0 seconds after `expiresAt` (utils/audit.py
+    # stamps it as now + 90 days at insert). Mongo's background thread
+    # does the cleanup; no application code or cron involved.
+    await db.audit_logs.create_index(
+        "expiresAt", expireAfterSeconds=0,
+    )
 
     # NOTIFICATIONS: per-user feed sorted newest-first; unread filter is common
     await db.notifications.create_index(
@@ -226,6 +232,13 @@ async def create_indexes():
     )
     await db.notifications.create_index(
         [("userId", 1), ("read", 1), ("createdAt", -1)]
+    )
+    # TTL: rows auto-delete after `expiresAt` (utils/notify.py stamps
+    # it as now + 60 days at insert). Older legacy rows lacking the
+    # field stay forever — they'll naturally age out as users mark
+    # them read or as fresh writes overwrite them.
+    await db.notifications.create_index(
+        "expiresAt", expireAfterSeconds=0,
     )
 
     # PROJECTS: unique code, listing by department/status

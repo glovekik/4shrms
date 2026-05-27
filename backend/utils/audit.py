@@ -5,10 +5,17 @@ recommendation, and 22 mandates them for payroll. Calls to log_audit()
 never raise — an audit failure must not break the underlying action.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from database import db
+
+
+# Audit rows auto-expire after 90 days via a TTL index on `expiresAt`
+# (see database.create_indexes). 3 months is enough for routine
+# investigations; for longer retention we'd archive to cold storage,
+# not bloat Mongo.
+AUDIT_TTL_DAYS = 90
 
 
 async def log_audit(
@@ -30,12 +37,14 @@ async def log_audit(
                   caller is responsible for converting). Optional.
     """
     try:
+        now = datetime.now(timezone.utc)
         doc = {
             "actorId": actor_id,
             "action": action,
             "entityType": entity_type,
             "entityId": entity_id,
-            "at": datetime.now(timezone.utc),
+            "at": now,
+            "expiresAt": now + timedelta(days=AUDIT_TTL_DAYS),
         }
         if before is not None:
             doc["before"] = before

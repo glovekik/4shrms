@@ -5,12 +5,19 @@ push + in-app, and never raises (a flaky FCM or DB write must not roll
 back the surrounding business action).
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from database import db
 from utils.push import push_to_user
 from utils.realtime import publish as realtime_publish
+
+
+# Notifications auto-expire 60 days after creation. The TTL index on
+# `expiresAt` (see database.create_indexes) lets Mongo delete them in
+# the background — no application code needed. 60 days is plenty of
+# time for users to see and act on alerts; older entries are noise.
+NOTIFICATION_TTL_DAYS = 60
 
 
 async def create_notification(
@@ -34,6 +41,7 @@ async def create_notification(
             "data": data or {},
             "read": False,
             "createdAt": now,
+            "expiresAt": now + timedelta(days=NOTIFICATION_TTL_DAYS),
         })
         inserted_id = str(result.inserted_id)
     except Exception as e:

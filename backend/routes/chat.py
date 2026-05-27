@@ -9,8 +9,9 @@ from typing import Optional
 
 from database import db
 from utils.dependencies import get_current_user_doc
-from utils.notify import notify_user, create_notification
+from utils.notify import notify_user
 from utils.push import push_to_users
+from utils.realtime import publish as realtime_publish
 from models.message import MessageCreate
 
 # Two routers, one helper set. Office and team chat are structurally identical
@@ -212,18 +213,27 @@ async def _insert_message(
             except Exception:
                 pass
 
-    # Every chat message (team + office) fans out a batch push +
-    # one bell-notification row per recipient. Author and already-
-    # mentioned users are skipped to avoid double-notifying. The bell
-    # row is what powers the notifications list; create_notification
-    # also fires a realtime SSE event so the dashboard chat badge and
-    # the bell unread count both update live.
-    #
-    # Watch-out: this design produces N bell rows per message, which
-    # CAN flood the bell for chatty channels. If that becomes a UX
-    # problem, the cleanest next step is a per-channel mute toggle on
-    # the user document plus a "collapse same-channel" rule in the
-    # notifications list — not changing this fan-out.
+    # Plain chat messages (no @mention) deliver via three lightweight
+    # channels — none of them write rows to db.notifications, which
+    # would otherwise grow by one row per recipient per message and
+    # eat the Atlas free-tier quota fast:
+    #   1. Expo PUSH (OS-level alert on devices with a registered token).
+    #   2. SSE realtime tick → drives the dashboard chat-tile badge to
+    #      refresh /me/chat-unread live. realtime_publish is a no-op
+    #      for users with no open SSE subscriber, so it's basically
+    #      free.
+    #   3. The chat thread's existing 3s poll picks up the message
+    #      when the recipient opens the screen.
+    # @mentions earlier in this function DO write a bell row via
+    # notify_user — those are deliberate.
+    chat_data = {
+        "type": "chat_message",
+        "channelType": channel_type,
+        "channelId": channel_id,
+        "messageId": str(msg["_id"]),
+        "authorId": user_id,
+    }
+
     if channel_type == "office":
         recipient_ids: list[str] = []
         async for u in db.users.find(
@@ -237,24 +247,17 @@ async def _insert_message(
                 continue
             recipient_ids.append(uid)
 
-        title = f"{author_name} · Office chat"
-        data_payload = {
-            "type": "chat_message",
-            "channelType": "office",
-            "channelId": None,
-            "messageId": str(msg["_id"]),
-            "authorId": user_id,
-        }
-
         if recipient_ids:
+            title = f"{author_name} · Office chat"
             try:
-                await push_to_users(recipient_ids, title, snippet, data_payload)
+                await push_to_users(recipient_ids, title, snippet, chat_data)
             except Exception:
                 pass
             for rid in recipient_ids:
                 try:
-                    await create_notification(
-                        rid, "chat_message", title, snippet, data_payload,
+                    await realtime_publish(
+                        rid,
+                        {"type": "notification", "data": chat_data},
                     )
                 except Exception:
                     pass
@@ -275,23 +278,17 @@ async def _insert_message(
                     f"{author_name} · "
                     f"{team.get('name') or 'Team chat'}"
                 )
-                data_payload = {
-                    "type": "chat_message",
-                    "channelType": "team",
-                    "channelId": channel_id,
-                    "messageId": str(msg["_id"]),
-                    "authorId": user_id,
-                }
                 try:
                     await push_to_users(
-                        recipients, title, snippet, data_payload,
+                        list(recipients), title, snippet, chat_data,
                     )
                 except Exception:
                     pass
                 for rid in recipients:
                     try:
-                        await create_notification(
-                            rid, "chat_message", title, snippet, data_payload,
+                        await realtime_publish(
+                            rid,
+                            {"type": "notification", "data": chat_data},
                         )
                     except Exception:
                         pass
