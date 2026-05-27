@@ -93,16 +93,8 @@ WEEKEND_DAYS = [
 
 
 # ================= UPLOADS =================
-# Two storage backends:
-#   STORAGE_BACKEND=local  → writes to UPLOAD_DIR on the container disk
-#                            (NOTE: Render web services have ephemeral
-#                            filesystems — files vanish on redeploy).
-#   STORAGE_BACKEND=drive  → uploads to a Google Drive folder owned by
-#                            a service account. Survives redeploys.
-#
-# Switching backends is a single env var; existing files keep working
-# because their URLs are stored in db.uploads and the GET /files/{id}
-# proxy reads the row's storageBackend field to know how to fetch.
+# Local file storage. For real production, swap to S3/Cloudflare R2 — the
+# /uploads endpoint stays the same; only the implementation changes.
 UPLOAD_DIR = os.getenv(
     "UPLOAD_DIR",
     str(Path(__file__).resolve().parent / "uploads"),
@@ -112,20 +104,7 @@ MAX_UPLOAD_BYTES = int(
 )
 # Public base URL used when constructing returned file URLs.
 # Set to your backend's public origin in prod (e.g. https://api.example.com).
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip()
-
-# Storage backend selection. Default "local" keeps dev simple.
-STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "local").strip().lower()
-
-# Google Drive backend config — only read when STORAGE_BACKEND=drive.
-# - GOOGLE_DRIVE_FOLDER_ID: the ID of the Drive folder (from the URL when
-#   you open the folder; it's the segment after /folders/).
-# - GOOGLE_SERVICE_ACCOUNT_JSON: the entire service-account JSON key
-#   content, pasted as a single env var. The folder above MUST be
-#   shared with that service account's email (xxx@yyy.iam.gserviceaccount.com)
-#   as Editor.
-GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 
 
 # ================= PUBLIC CAREERS / OFFER ACCEPT =================

@@ -1,9 +1,6 @@
-from typing import Optional
-
 from fastapi import (
     Depends,
     HTTPException,
-    Query,
     status,
 )
 
@@ -26,10 +23,6 @@ from database import db
 from config import SECRET_KEY, ALGORITHM
 
 security = HTTPBearer()
-# Bearer is auto_error=False here because the flexible dependency below
-# also accepts a ?token= query string, so missing-header alone shouldn't
-# 401 — we let the function decide.
-security_optional = HTTPBearer(auto_error=False)
 
 
 # ================= GET CURRENT USER =================
@@ -81,43 +74,6 @@ async def get_current_user(
 
             detail=
             "Invalid token"
-        )
-
-
-# ================= FLEXIBLE AUTH (header OR ?token=) =================
-# Standard get_current_user only reads the Authorization header. That
-# breaks <Image src=...> on the frontend, which doesn't send headers.
-# This variant also accepts the JWT as a ?token= query string so
-# image / link contexts can still authenticate. Used by GET /files/{id}.
-async def get_current_user_flexible(
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(
-        security_optional,
-    ),
-    token: Optional[str] = Query(default=None),
-):
-    raw = None
-    if credentials and credentials.credentials:
-        raw = credentials.credentials
-    elif token:
-        raw = token
-    if not raw:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Auth required",
-        )
-    try:
-        payload = jwt.decode(raw, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id = payload.get("sub")
-        if not user_id:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid token",
-            )
-        return user_id
-    except JWTError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token",
         )
 
 
