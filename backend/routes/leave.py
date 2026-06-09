@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from bson import ObjectId
 from bson.errors import InvalidId
 
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, timedelta
 
 from typing import Optional
 
@@ -11,13 +11,14 @@ from database import db
 from utils.dependencies import (
     get_current_user,
     require_hr,
+    require_hr_or_ceo,
     require_manager_or_hr,
     can_decide_for_employee,
 )
 from utils.push import push_to_user
 from utils.email import send_notification_email
 from utils.audit import log_audit
-from utils.notify import create_notification
+from utils.notify import create_notification, notify_approvers, notify_user
 from config import COMPANY_NAME
 from models.leave import (
     LeaveTypeCreate,
@@ -95,6 +96,37 @@ async def _decide_leave_internal(
                 }
             },
         )
+
+        # Auto-mark each approved leave day as LEAVE attendance so it shows
+        # in the employee's history/calendar. Only working days are marked
+        # (Sundays + declared holidays are skipped, same as the balance
+        # charge). Race-safe: never clobber a date that already has a
+        # record (e.g. a real check-in).
+        leave_note = f"{req.get('leaveTypeCode', '')} leave".strip()
+        if req.get("halfDay"):
+            part = req.get("halfDayPart")
+            leave_note += f" (half day{f' — {part}' if part else ''})"
+        for ymd in await _working_dates_in_range(
+            req["fromDate"], req["toDate"]
+        ):
+            already = await db.attendance.find_one(
+                {"userId": req["userId"], "date": ymd}
+            )
+            if not already:
+                await db.attendance.insert_one({
+                    "userId": req["userId"],
+                    "date": ymd,
+                    "attendanceType": "LEAVE",
+                    "status": "ON_LEAVE",
+                    "checkIn": None,
+                    "checkOut": None,
+                    "workNotes": leave_note,
+                    "autoAppliedFromLeave": True,
+                    "leaveRequestId": str(oid),
+                    "createdAt": now,
+                    "updatedAt": now,
+                })
+
         try:
             await push_to_user(
                 req["userId"],
@@ -328,26 +360,64 @@ def _parse_date(s: str, field: str) -> date:
         )
 
 
-def _calc_total_days(
+async def _working_dates_in_range(
+    from_date: str,
+    to_date: str,
+) -> list[str]:
+    """Working days (YYYY-MM-DD) in [from_date, to_date] inclusive, with
+    Sundays and HR-declared holidays excluded. Shared by the balance calc
+    and the on-approval attendance auto-apply so they always agree."""
+    f = _parse_date(from_date, "fromDate")
+    t = _parse_date(to_date, "toDate")
+    if t < f:
+        raise HTTPException(400, "toDate cannot be before fromDate")
+
+    holiday_dates: set[str] = set()
+    async for h in db.holidays.find(
+        {"date": {"$gte": from_date, "$lte": to_date}},
+        {"date": 1},
+    ):
+        if h.get("date"):
+            holiday_dates.add(h["date"])
+
+    out: list[str] = []
+    d = f
+    while d <= t:
+        ymd = d.isoformat()
+        # weekday(): Monday=0 … Sunday=6. Skip Sundays + declared holidays.
+        if d.weekday() != 6 and ymd not in holiday_dates:
+            out.append(ymd)
+        d += timedelta(days=1)
+    return out
+
+
+async def _calc_total_days(
     from_date: str,
     to_date: str,
     half_day: bool,
 ) -> float:
-    f = _parse_date(from_date, "fromDate")
-    t = _parse_date(to_date, "toDate")
-    if t < f:
-        raise HTTPException(
-            400,
-            "toDate cannot be before fromDate",
-        )
+    """Chargeable leave days — excludes Sundays and declared holidays."""
+    working = await _working_dates_in_range(from_date, to_date)
     if half_day:
+        f = _parse_date(from_date, "fromDate")
+        t = _parse_date(to_date, "toDate")
         if f != t:
             raise HTTPException(
+                400, "Half-day leave must be a single day"
+            )
+        if not working:
+            raise HTTPException(
                 400,
-                "Half-day leave must be a single day",
+                "Half-day must fall on a working day (not a Sunday/holiday).",
             )
         return 0.5
-    return float((t - f).days + 1)
+    if not working:
+        raise HTTPException(
+            400,
+            "The selected range has no working days "
+            "(only Sundays/holidays).",
+        )
+    return float(len(working))
 
 
 def _default_allocated(leave_type: Optional[dict]) -> float:
@@ -693,7 +763,7 @@ async def create_leave_request(
     if not reason:
         raise HTTPException(400, "Reason is required")
 
-    total_days = _calc_total_days(
+    total_days = await _calc_total_days(
         data.fromDate,
         data.toDate,
         data.halfDay,
@@ -770,6 +840,18 @@ async def create_leave_request(
         },
     )
 
+    # Notify approvers (reporting manager + HR) that a request is pending.
+    submitter = await db.users.find_one({"_id": ObjectId(user_id)}, {"name": 1})
+    who = (submitter or {}).get("name") or "An employee"
+    await notify_approvers(
+        user_id,
+        "leave_requests",
+        "New leave request",
+        f"{who} requested {total_days}d {data.leaveTypeCode} "
+        f"({data.fromDate} → {data.toDate})",
+        {"leaveRequestId": str(result.inserted_id)},
+    )
+
     return _serialize_request(request_doc, None, leave_type)
 
 
@@ -822,6 +904,21 @@ async def cancel_leave_request(
             "$inc": {"pending": -req.get("totalDays", 0)},
             "$set": {"updatedAt": now},
         },
+    )
+
+    # Tell the approvers the pending request was withdrawn so they don't
+    # act on it.
+    submitter = await db.users.find_one(
+        {"_id": ObjectId(user_id)}, {"name": 1}
+    )
+    who = (submitter or {}).get("name") or "An employee"
+    await notify_approvers(
+        user_id,
+        "leave_cancelled",
+        "Leave request cancelled",
+        f"{who} withdrew their {req['fromDate']} → {req['toDate']} "
+        f"leave request",
+        {"leaveRequestId": id},
     )
 
     return {"message": "Leave cancelled"}
@@ -1013,7 +1110,7 @@ async def delete_leave_type(
 @hr_router.get("/leave-requests")
 async def list_leave_requests(
     status: Optional[str] = Query(None),
-    _hr: dict = Depends(require_hr),
+    _hr: dict = Depends(require_hr_or_ceo),
 ):
     query: dict = {}
     if status:
@@ -1230,6 +1327,17 @@ async def hr_upsert_user_balance(
             "pending": data.pending,
             "note": data.note,
         },
+    )
+
+    # Let the employee know their balance was changed by HR.
+    await notify_user(
+        userId,
+        "leave_balance_updated",
+        "Leave balance updated",
+        f"Your {data.leaveTypeCode} balance for {target_year} is now "
+        f"{data.allocated} day(s)."
+        + (f" {data.note}" if data.note else ""),
+        {"leaveTypeCode": data.leaveTypeCode, "year": target_year},
     )
 
     return _serialize_balance(row or {}, leave_type)

@@ -192,13 +192,13 @@ class HRCreateUser(BaseModel):
 class HRUserUpdate(BaseModel):
     """Partial update — only fields HR is allowed to change.
 
-    Intentionally excludes email and password:
-      - email is identity-sensitive
-      - password change should go through the reset flow
+    Email IS allowed (HR can correct/change the login email); the route
+    enforces uniqueness. Password still goes through the reset flow only.
     Role IS allowed here — HR can promote anyone to HR/MANAGER/USER.
     Any safety guard on HR promotion lives in the route, not the model.
     """
     name: Optional[str] = None
+    email: Optional[EmailStr] = None
     role: Optional[Literal["MANAGER", "USER", "HR"]] = None
     tag: Optional[UserTag] = None
     employeeCode: Optional[str] = None

@@ -166,6 +166,12 @@ def _serialize_payslip(
         "netPay": p.get("netPay", 0),
         # Status
         "status": p.get("status", "GENERATED"),
+        # Release state — whether HR has sent this to the employee yet.
+        "sent": bool(p.get("sent", False)),
+        "sentAt": (
+            p["sentAt"].isoformat()
+            if p.get("sentAt") else None
+        ),
         "notes": p.get("notes", ""),
         "generatedAt": (
             p["generatedAt"].isoformat()
@@ -542,6 +548,10 @@ async def process_payroll_run(
             "totalDeductions": total_deductions,
             "netPay": net_pay,
             "status": "GENERATED",
+            # Payslips are NOT visible to the employee until HR explicitly
+            # sends them. Processing only prepares them for HR to review.
+            "sent": False,
+            "sentAt": None,
             "notes": "",
             "generatedAt": now,
             "updatedAt": now,
@@ -562,38 +572,10 @@ async def process_payroll_run(
         },
     )
 
-    # Notify each employee that has a payslip in this run.
-    notified_users: list[str] = []
-    async for slip in db.payslips.find(
-        {"payrollRunId": id},
-        {"userId": 1},
-    ):
-        if slip.get("userId"):
-            notified_users.append(slip["userId"])
-
-    try:
-        await push_to_users(
-            notified_users,
-            "Payslip ready",
-            f"{month_name[month]} {year} payslip is ready",
-            {"type": "payslip_ready", "runId": id},
-        )
-    except Exception:
-        pass
-
-    # Mirror the push with an in-app notification so the bell shows it too,
-    # even for users whose push permission was denied or who missed it.
-    for uid in notified_users:
-        try:
-            await create_notification(
-                uid,
-                "payslip_ready",
-                "Payslip ready",
-                f"{month_name[month]} {year} payslip is ready",
-                {"runId": id},
-            )
-        except Exception:
-            pass
+    # NOTE: employees are intentionally NOT notified here. Processing only
+    # generates payslips for HR review; the employee notification + push
+    # fire when HR explicitly sends the payslip(s) — see the /send and
+    # /send-all endpoints below.
 
     return {
         "message": "Payroll processed",
@@ -781,13 +763,13 @@ async def override_payslip(
 async def my_payslips(
     user_id: str = Depends(get_current_user),
 ):
-    """Caller's own payslip history (only payslips from PROCESSED or LOCKED
-    runs are visible — DRAFT-only payslips never exist; reprocessing
-    happens before DRAFT→PROCESSED)."""
+    """Caller's own payslip history. Only payslips HR has explicitly SENT
+    are visible — unsent (processed-but-not-released) payslips stay hidden
+    until HR hits Send."""
     await _block_if_intern_restricted(user_id)
     raw = []
     async for p in db.payslips.find(
-        {"userId": user_id}
+        {"userId": user_id, "sent": True}
     ).sort([("year", -1), ("month", -1)]):
         raw.append(p)
     return [_serialize_payslip(p) for p in raw]
@@ -808,6 +790,9 @@ async def my_payslip(
         raise HTTPException(404, "Payslip not found")
     if p.get("userId") != user_id:
         raise HTTPException(403, "Not your payslip")
+    # Unsent payslips don't exist as far as the employee is concerned.
+    if not p.get("sent"):
+        raise HTTPException(404, "Payslip not found")
     return _serialize_payslip(p)
 
 
@@ -905,6 +890,8 @@ async def my_payslip_pdf(
         raise HTTPException(404, "Payslip not found")
     if p.get("userId") != user_id:
         raise HTTPException(403, "Not your payslip")
+    if not p.get("sent"):
+        raise HTTPException(404, "Payslip not found")
 
     pdf_bytes = await _load_pdf_bytes(p)
     user = await db.users.find_one({
@@ -1102,3 +1089,82 @@ async def email_all_payslips(
         "failed": failed,
         "skipped": skipped,
     }
+
+
+# ================= HR: SEND (RELEASE) PAYSLIPS =================
+async def _notify_payslip_sent(payslip: dict) -> None:
+    """Push + in-app bell telling the employee their payslip is available."""
+    uid = payslip.get("userId")
+    if not uid:
+        return
+    month = payslip.get("month", 1)
+    year = payslip.get("year", "")
+    title = "Payslip ready"
+    body = f"{month_name[month]} {year} payslip is ready"
+    try:
+        await push_to_users(
+            [uid], title, body,
+            {"type": "payslip_ready", "payslipId": str(payslip["_id"])},
+        )
+    except Exception:
+        pass
+    try:
+        await create_notification(
+            uid, "payslip_ready", title, body,
+            {"payslipId": str(payslip["_id"])},
+        )
+    except Exception:
+        pass
+
+
+@hr_router.post("/payslips/{id}/send")
+async def send_payslip(
+    id: str,
+    _hr: dict = Depends(require_hr),
+):
+    """Release a single payslip to the employee: make it visible in My
+    Payslips and notify them. Idempotent — re-sending just re-notifies."""
+    try:
+        oid = ObjectId(id)
+    except (InvalidId, TypeError):
+        raise HTTPException(400, "Invalid id")
+
+    p = await db.payslips.find_one({"_id": oid})
+    if not p:
+        raise HTTPException(404, "Payslip not found")
+
+    now = datetime.now(timezone.utc)
+    await db.payslips.update_one(
+        {"_id": oid},
+        {"$set": {"sent": True, "sentAt": now}},
+    )
+    await _notify_payslip_sent(p)
+
+    return {"message": "Payslip sent", "payslipId": id}
+
+
+@hr_router.post("/payroll/runs/{id}/send-all")
+async def send_all_payslips(
+    id: str,
+    _hr: dict = Depends(require_hr),
+):
+    """Release every payslip in a run to its employee + notify each."""
+    try:
+        run_oid = ObjectId(id)
+    except (InvalidId, TypeError):
+        raise HTTPException(400, "Invalid id")
+    run = await db.payroll_runs.find_one({"_id": run_oid})
+    if not run:
+        raise HTTPException(404, "Payroll run not found")
+
+    now = datetime.now(timezone.utc)
+    sent_count = 0
+    async for p in db.payslips.find({"payrollRunId": id}):
+        await db.payslips.update_one(
+            {"_id": p["_id"]},
+            {"$set": {"sent": True, "sentAt": now}},
+        )
+        await _notify_payslip_sent(p)
+        sent_count += 1
+
+    return {"message": "Payslips sent", "sentCount": sent_count}

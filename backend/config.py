@@ -18,20 +18,28 @@ ALGORITHM = "HS256"
 
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 
+# Refresh tokens keep the app signed in across access-token expiry. The
+# access token above stays short-lived (and can be shortened now that
+# refresh exists); the refresh token is long-lived and stored server-side
+# (db.refresh_tokens) so it can be revoked on logout / compromise.
+REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "30"))
+
 
 # ================= COMPANY (used in payslip PDFs / emails) =================
 COMPANY_NAME = os.getenv(
     "COMPANY_NAME",
-    "Your Company",
+    "ForesightAI Technologies Private Limited",
 )
 COMPANY_ADDRESS = os.getenv(
     "COMPANY_ADDRESS",
     "",
 )
-# Local path to a logo image (PNG/JPG). Empty = no logo on the payslip.
+# Local path to a logo image (PNG/JPG). Defaults to the bundled brand logo
+# in backend/assets so payslips/letters carry the logo even without an env
+# override. Set COMPANY_LOGO_PATH="" to disable.
 COMPANY_LOGO_PATH = os.getenv(
     "COMPANY_LOGO_PATH",
-    "",
+    str(Path(__file__).resolve().parent / "assets" / "company-logo.png"),
 )
 
 

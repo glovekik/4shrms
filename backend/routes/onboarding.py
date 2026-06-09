@@ -10,6 +10,7 @@ from typing import Optional
 from uuid import uuid4
 
 from database import db
+from utils.notify import notify_user
 from utils.dependencies import (
     get_current_user,
     require_hr,
@@ -168,6 +169,16 @@ async def create_onboarding(
     }
     result = await db.onboardings.insert_one(doc)
     doc["_id"] = result.inserted_id
+
+    # Welcome the new hire + point them at their onboarding tasks.
+    await notify_user(
+        data.userId,
+        "onboarding_started",
+        "Welcome aboard!",
+        "Your onboarding has started — check your tasks and documents.",
+        {"onboardingId": str(result.inserted_id)},
+    )
+
     return _serialize(doc)
 
 
@@ -364,6 +375,21 @@ async def complete_onboarding(
             }
         },
     )
+
+    # Let the HR who owns this onboarding know it's done.
+    if o.get("createdBy"):
+        emp = await db.users.find_one(
+            {"_id": ObjectId(o["userId"])}, {"name": 1}
+        ) if o.get("userId") else None
+        who = (emp or {}).get("name") or "An employee"
+        await notify_user(
+            o["createdBy"],
+            "onboarding_completed",
+            "Onboarding completed",
+            f"Onboarding for {who} is complete.",
+            {"onboardingId": str(o["_id"])},
+        )
+
     return {"message": "Onboarding completed"}
 
 

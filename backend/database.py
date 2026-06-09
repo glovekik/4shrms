@@ -202,6 +202,21 @@ async def create_indexes():
         expireAfterSeconds=0,
     )
 
+    # REFRESH TOKENS: long-lived, revocable session tokens. Unique token,
+    # TTL cleanup on expiresAt (Mongo purges expired sessions), and per-user
+    # lookup for "revoke all my sessions".
+    await db.refresh_tokens.create_index(
+        "token",
+        unique=True,
+    )
+    await db.refresh_tokens.create_index(
+        "expiresAt",
+        expireAfterSeconds=0,
+    )
+    await db.refresh_tokens.create_index(
+        "userId",
+    )
+
     # DEPARTMENTS: unique name (case-sensitive)
     await db.departments.create_index(
         "name",

@@ -18,11 +18,12 @@ from database import db
 from utils.dependencies import (
     get_current_user,
     require_hr,
+    require_hr_or_ceo,
     require_manager_or_hr,
     can_decide_for_employee,
 )
 from utils.audit import log_audit
-from utils.notify import create_notification
+from utils.notify import create_notification, notify_approvers
 from utils.push import push_to_user
 from models.manual_attendance import (
     ManualAttendanceCreate,
@@ -168,6 +169,18 @@ async def submit_manual_request(
     }
     result = await db.manual_attendance_requests.insert_one(doc)
     doc["_id"] = result.inserted_id
+
+    # Notify approvers (reporting manager + HR) of the pending request.
+    who_doc = await db.users.find_one({"_id": ObjectId(user_id)}, {"name": 1})
+    who = (who_doc or {}).get("name") or "An employee"
+    await notify_approvers(
+        user_id,
+        "manual_requests",
+        "New manual attendance request",
+        f"{who} requested manual attendance for {data.date}",
+        {"manualRequestId": str(result.inserted_id)},
+    )
+
     return _serialize(doc)
 
 
@@ -216,6 +229,21 @@ async def cancel_my_manual_request(
             }
         },
     )
+
+    # Tell approvers the pending request was withdrawn.
+    submitter = await db.users.find_one(
+        {"_id": ObjectId(user_id)}, {"name": 1}
+    )
+    who = (submitter or {}).get("name") or "An employee"
+    await notify_approvers(
+        user_id,
+        "manual_request_cancelled",
+        "Manual attendance request cancelled",
+        f"{who} withdrew their manual attendance request for "
+        f"{r.get('date')}",
+        {"manualRequestId": id},
+    )
+
     return {"message": "Request cancelled"}
 
 
@@ -265,7 +293,7 @@ async def manager_list_manual_requests(
 @hr_router.get("")
 async def hr_list_manual_requests(
     status: Optional[str] = Query(None),
-    _hr: dict = Depends(require_hr),
+    _hr: dict = Depends(require_hr_or_ceo),
 ):
     raw: list[dict] = []
     query: dict = {}

@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from database import db
+from utils.notify import notify_user
 from utils.dependencies import (
     get_current_user,
     require_hr,
@@ -232,6 +233,17 @@ async def hr_set_required_documents(
         after={"categories": [i["category"] for i in new_items]},
     )
 
+    # Tell the employee which documents are still pending from them.
+    pending = [i["category"] for i in new_items if i.get("status") == "PENDING"]
+    if pending:
+        await notify_user(
+            userId,
+            "documents_required",
+            "Documents requested",
+            "Please upload: " + ", ".join(pending),
+            {"categories": pending},
+        )
+
     return {"items": new_items}
 
 
@@ -290,6 +302,15 @@ async def hr_verify_required_document(
             400,
             "No uploaded document found for that category",
         )
+
+    await notify_user(
+        userId,
+        "document_verified",
+        "Document verified",
+        f"Your {category} document was verified.",
+        {"category": category},
+    )
+
     return {"message": "Document verified"}
 
 

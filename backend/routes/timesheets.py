@@ -21,7 +21,7 @@ from utils.dependencies import (
     can_decide_for_employee,
 )
 from utils.audit import log_audit
-from utils.notify import notify_user
+from utils.notify import notify_user, notify_approvers
 from models.timesheet import (
     TimesheetEntry,
     TimesheetSubmit,
@@ -188,6 +188,18 @@ async def submit_timesheet(
     else:
         result = await db.timesheets.insert_one(doc)
         record_id = result.inserted_id
+
+    # Notify approvers (reporting manager + HR) of the submitted timesheet.
+    who_doc = await db.users.find_one({"_id": ObjectId(user_id)}, {"name": 1})
+    who = (who_doc or {}).get("name") or "An employee"
+    await notify_approvers(
+        user_id,
+        "timesheet_submitted",
+        "Timesheet submitted",
+        f"{who} submitted a timesheet for week of {data.weekStart} "
+        f"({total}h)",
+        {"timesheetId": str(record_id)},
+    )
 
     saved = await db.timesheets.find_one({"_id": record_id})
     return _serialize(saved)

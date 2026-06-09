@@ -1,4 +1,8 @@
-from fastapi import FastAPI
+import logging
+import time
+from collections import defaultdict
+
+from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 
@@ -213,6 +217,78 @@ app.add_middleware(
 
     allow_headers=["*"],
 )
+
+
+# ================= REQUEST TIMING =================
+# There was no per-request timing anywhere, so "which API is slow" was
+# unanswerable from real traffic. This middleware times every request,
+# logs the duration (flagging anything over SLOW_REQUEST_MS), and keeps
+# in-process aggregates per route template so GET /_metrics/timings gives
+# a live count / avg / p95 / max per endpoint. Single uvicorn worker, so
+# the in-memory store is the whole picture; restart clears it.
+logger = logging.getLogger("api.timing")
+logging.basicConfig(level=logging.INFO)
+
+SLOW_REQUEST_MS = 1000.0
+
+# route-template -> list of recent durations (ms). Capped per route so
+# memory stays bounded regardless of traffic.
+_TIMING_SAMPLES: dict = defaultdict(list)
+_MAX_SAMPLES_PER_ROUTE = 500
+
+
+@app.middleware("http")
+async def time_requests(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+    # The matched route template (e.g. "/hr/users/{user_id}") is populated
+    # on the scope during routing; fall back to the raw path for unmatched
+    # requests (404s) so they don't all collapse into one bucket.
+    route = request.scope.get("route")
+    label = getattr(route, "path", None) or request.url.path
+    key = f"{request.method} {label}"
+
+    samples = _TIMING_SAMPLES[key]
+    samples.append(elapsed_ms)
+    if len(samples) > _MAX_SAMPLES_PER_ROUTE:
+        del samples[0]
+
+    response.headers["X-Process-Time-Ms"] = f"{elapsed_ms:.1f}"
+
+    line = f"{key} {response.status_code} {elapsed_ms:.1f}ms"
+    if elapsed_ms >= SLOW_REQUEST_MS:
+        logger.warning("SLOW %s", line)
+    else:
+        logger.info(line)
+
+    return response
+
+
+@app.get("/_metrics/timings", tags=["Ops"])
+async def timing_metrics():
+    """Per-endpoint response-time aggregates since the last restart.
+
+    Sorted slowest-first by p95 so the worst endpoints surface at the top.
+    """
+    out = []
+    for key, samples in _TIMING_SAMPLES.items():
+        if not samples:
+            continue
+        ordered = sorted(samples)
+        n = len(ordered)
+        p95 = ordered[min(n - 1, int(round(0.95 * (n - 1))))]
+        out.append({
+            "endpoint": key,
+            "count": n,
+            "avg_ms": round(sum(ordered) / n, 1),
+            "p95_ms": round(p95, 1),
+            "max_ms": round(ordered[-1], 1),
+            "min_ms": round(ordered[0], 1),
+        })
+    out.sort(key=lambda r: r["p95_ms"], reverse=True)
+    return {"slow_threshold_ms": SLOW_REQUEST_MS, "endpoints": out}
 
 
 # ================= ROUTES =================

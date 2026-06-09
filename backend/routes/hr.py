@@ -22,6 +22,7 @@ from database import db
 from utils.dependencies import require_hr, require_hr_or_ceo
 from utils.email import send_notification_email
 from utils.audit import log_audit
+from utils.notify import notify_user
 from models.user import HRCreateUser, HRUserUpdate
 from models.team import TeamCreate, TeamUpdate
 
@@ -499,6 +500,16 @@ async def update_user(
             exclude_user_id=oid,
         )
 
+    # Email is the login identity — only change it when it actually
+    # differs, and never let two users share one. Matched exactly, same as
+    # create_user / login (which don't lowercase).
+    if data.email is not None and data.email != existing.get("email"):
+        dup = await db.users.find_one(
+            {"email": data.email, "_id": {"$ne": oid}}
+        )
+        if dup:
+            raise HTTPException(400, "Email already in use")
+
     # Validate org-structure references when changing them.
     if data.departmentId not in (None, ""):
         await _validate_department(data.departmentId)
@@ -521,6 +532,7 @@ async def update_user(
     # untouched.
     scalar_fields = (
         "name",
+        "email",
         "role",
         "tag",
         "employeeCode",
@@ -624,6 +636,18 @@ async def create_team(
 
     result = await db.teams.insert_one(team)
 
+    # Tell the lead + members they've been added to the team.
+    actor_id = str(hr["_id"])
+    for uid in {data.teamLeadId, *data.memberIds} - {actor_id}:
+        if uid:
+            await notify_user(
+                uid,
+                "team_added",
+                "Added to a team",
+                f"You've been added to the team \"{data.name}\".",
+                {"teamId": str(result.inserted_id)},
+            )
+
     return {
         "id": str(result.inserted_id),
         "message": "Team created",
@@ -704,6 +728,13 @@ async def update_team(
             detail="Invalid id",
         )
 
+    existing = await db.teams.find_one({"_id": oid})
+    if not existing:
+        raise HTTPException(
+            status_code=404,
+            detail="Team not found",
+        )
+
     update: dict = {
         "updatedAt": datetime.now(timezone.utc),
     }
@@ -719,16 +750,27 @@ async def update_team(
         await _validate_user_ids(data.memberIds)
         update["memberIds"] = data.memberIds
 
-    result = await db.teams.update_one(
+    await db.teams.update_one(
         {"_id": oid},
         {"$set": update},
     )
 
-    if result.matched_count == 0:
-        raise HTTPException(
-            status_code=404,
-            detail="Team not found",
-        )
+    # Notify only people newly added to the team (lead or member).
+    before = {existing.get("teamLeadId"), *(existing.get("memberIds") or [])}
+    after = {
+        update.get("teamLeadId", existing.get("teamLeadId")),
+        *(update.get("memberIds", existing.get("memberIds") or [])),
+    }
+    team_name = update.get("name", existing.get("name", "a team"))
+    for uid in (after - before):
+        if uid:
+            await notify_user(
+                uid,
+                "team_added",
+                "Added to a team",
+                f"You've been added to the team \"{team_name}\".",
+                {"teamId": id},
+            )
 
     return {"message": "Team updated"}
 

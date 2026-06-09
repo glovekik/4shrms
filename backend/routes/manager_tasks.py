@@ -19,7 +19,7 @@ from typing import Optional
 
 from database import db
 from utils.dependencies import get_current_user_doc
-from utils.notify import create_notification
+from utils.notify import create_notification, notify_user
 from utils.push import push_to_user
 from models.task import TaskCreate, TaskUpdate
 
@@ -273,6 +273,19 @@ async def update_team_task(
         update["attachments"] = data.attachments
 
     await db.tasks.update_one({"_id": oid}, {"$set": update})
+
+    # If the task was reassigned to a different person, notify the new
+    # assignee that it's now theirs.
+    new_assignee = update.get("assigneeId")
+    if new_assignee and new_assignee != task.get("assigneeId"):
+        await notify_user(
+            new_assignee,
+            "task_assigned",
+            "Task assigned to you",
+            update.get("title") or task.get("title", ""),
+            {"taskId": str(oid)},
+        )
+
     return {"message": "Task updated"}
 
 

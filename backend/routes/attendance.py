@@ -13,6 +13,7 @@ from bson import ObjectId
 from bson.errors import InvalidId
 
 from database import db
+from utils.notify import notify_user
 
 from utils.dependencies import (
     get_current_user,
@@ -448,13 +449,25 @@ async def delete_attendance(
             detail="Invalid id"
         )
 
-    result = await db.attendance.delete_one({"_id": object_id})
-
-    if result.deleted_count == 0:
+    # Fetch first so we know whose record it is (for the notification).
+    existing = await db.attendance.find_one({"_id": object_id})
+    if not existing:
 
         raise HTTPException(
             status_code=404,
             detail="Attendance not found"
+        )
+
+    await db.attendance.delete_one({"_id": object_id})
+
+    if existing.get("userId"):
+        await notify_user(
+            existing["userId"],
+            "attendance_edited",
+            "Attendance removed by HR",
+            f"Your attendance record for "
+            f"{existing.get('date', 'a day')} was removed by HR.",
+            {"date": existing.get("date")},
         )
 
     return {
@@ -575,6 +588,17 @@ async def update_attendance(
             update_data
         }
     )
+
+    # Let the employee know HR edited their attendance record.
+    if existing.get("userId"):
+        await notify_user(
+            existing["userId"],
+            "attendance_edited",
+            "Attendance updated by HR",
+            f"Your attendance for {existing.get('date', 'a day')} "
+            f"was updated by HR.",
+            {"attendanceId": id, "date": existing.get("date")},
+        )
 
     return {
         "message":

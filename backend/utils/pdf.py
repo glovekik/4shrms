@@ -101,8 +101,10 @@ def build_payslip_pdf(
             header_left.append(
                 Image(
                     COMPANY_LOGO_PATH,
-                    width=35 * mm,
-                    height=15 * mm,
+                    # Preserve the logo's ~2.57:1 aspect ratio so it isn't
+                    # squished (1871x729 source).
+                    width=42 * mm,
+                    height=16.4 * mm,
                 )
             )
         except Exception:
@@ -382,8 +384,9 @@ def build_experience_letter_pdf(
             elements.append(
                 Image(
                     COMPANY_LOGO_PATH,
-                    width=40 * mm,
-                    height=18 * mm,
+                    # Preserve the logo's ~2.57:1 aspect ratio (no squish).
+                    width=44 * mm,
+                    height=17.1 * mm,
                 )
             )
         except Exception:

@@ -8,6 +8,7 @@ from datetime import datetime, timezone, date
 from typing import Optional
 
 from database import db
+from utils.notify import notify_all_active
 from utils.dependencies import (
     get_current_user,
     require_hr,
@@ -123,6 +124,15 @@ async def create_holiday(
     }
     result = await db.holidays.insert_one(doc)
     doc["_id"] = result.inserted_id
+
+    # Announce the new holiday to everyone.
+    await notify_all_active(
+        "holiday_declared",
+        "Holiday declared",
+        f"{data.name} — {data.date}",
+        {"holidayId": str(result.inserted_id), "date": data.date},
+    )
+
     return _serialize(doc)
 
 

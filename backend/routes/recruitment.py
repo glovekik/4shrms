@@ -569,6 +569,24 @@ async def submit_interview_feedback(
             "$set": {"status": "COMPLETED", "updatedAt": now},
         },
     )
+
+    # Notify whoever scheduled the interview (recruiter/HR) that feedback
+    # is in — unless they're the one who submitted it.
+    owner = interview.get("createdBy")
+    if owner and owner != user_id:
+        candidate = await db.candidates.find_one(
+            {"_id": ObjectId(interview["candidateId"])}, {"name": 1}
+        ) if interview.get("candidateId") else None
+        cand_name = (candidate or {}).get("name") or "a candidate"
+        await notify_user(
+            owner,
+            "interview_feedback_submitted",
+            "Interview feedback submitted",
+            f"{user.get('name', 'An interviewer')} left feedback for "
+            f"{cand_name} ({data.recommendation}).",
+            {"interviewId": id, "candidateId": interview.get("candidateId")},
+        )
+
     return {"message": "Feedback recorded"}
 
 

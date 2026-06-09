@@ -15,7 +15,7 @@ from utils.dependencies import (
 )
 from utils.email import send_notification_email
 from utils.push import push_to_user
-from utils.notify import create_notification
+from utils.notify import create_notification, notify_user
 from models.comment import CommentCreate
 
 router = APIRouter()
@@ -515,6 +515,23 @@ async def add_comment(
 
     result = await db.comments.insert_one(comment)
     comment["_id"] = result.inserted_id
+
+    # Notify the other party on the task (assignee + creator), minus the
+    # commenter, so a conversation doesn't go unseen.
+    author = user.get("name") or "Someone"
+    snippet = text if len(text) <= 120 else text[:117] + "..."
+    targets = {
+        t for t in (task.get("assigneeId"), task.get("createdBy")) if t
+    }
+    targets.discard(user_id)
+    for tid in targets:
+        await notify_user(
+            tid,
+            "task_comment",
+            f"{author} commented",
+            f"{task.get('title', 'Task')}: {snippet}",
+            {"taskId": id},
+        )
 
     user_info = {
         "id": user_id,

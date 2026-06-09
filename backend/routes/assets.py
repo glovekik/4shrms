@@ -12,7 +12,7 @@ from utils.dependencies import (
     get_current_user,
     require_hr,
 )
-from utils.notify import notify_user
+from utils.notify import notify_user, notify_hr
 from models.asset import (
     AssetCreate,
     AssetUpdate,
@@ -507,6 +507,16 @@ async def resolve_asset_report(
         except (InvalidId, TypeError, KeyError):
             pass
 
+    # Tell the employee who raised the issue how it was handled.
+    if report.get("reportedBy"):
+        await notify_user(
+            report["reportedBy"],
+            "asset_issue_resolved",
+            f"Asset issue {new_status.lower()}",
+            data.resolution or "Your reported asset issue was updated.",
+            {"reportId": id, "outcome": new_status},
+        )
+
     return {"message": f"Report {new_status.lower()}"}
 
 
@@ -565,5 +575,18 @@ async def report_asset_issue(
 
     result = await db.asset_reports.insert_one(doc)
     doc["_id"] = result.inserted_id
+
+    # Alert HR that an asset issue needs attention.
+    reporter = await db.users.find_one(
+        {"_id": ObjectId(user_id)}, {"name": 1}
+    )
+    who = (reporter or {}).get("name") or "An employee"
+    await notify_hr(
+        "asset_issue_reported",
+        "Asset issue reported",
+        f"{who} reported an issue with {a.get('name', 'an asset')} "
+        f"({a.get('code', '')})",
+        {"reportId": str(result.inserted_id), "assetId": id},
+    )
 
     return _serialize_report(doc)

@@ -19,11 +19,12 @@ from utils.dependencies import (
     get_current_user,
     get_current_user_doc,
     require_hr,
+    require_hr_or_ceo,
     require_manager_or_hr,
     can_decide_for_employee,
 )
 from utils.audit import log_audit
-from utils.notify import notify_user
+from utils.notify import notify_user, notify_approvers
 from models.reimbursement import (
     ReimbursementCreate,
     ReimbursementDecision,
@@ -148,6 +149,18 @@ async def create_reimbursement(
     }
     result = await db.reimbursement_requests.insert_one(doc)
     doc["_id"] = result.inserted_id
+
+    # Notify approvers (reporting manager + HR) of the pending claim.
+    who_doc = await db.users.find_one({"_id": ObjectId(user_id)}, {"name": 1})
+    who = (who_doc or {}).get("name") or "An employee"
+    await notify_approvers(
+        user_id,
+        "reimbursement_requests",
+        "New reimbursement claim",
+        f"{who} submitted a {data.amount} claim: {doc['title']}",
+        {"reimbursementId": str(result.inserted_id)},
+    )
+
     return _serialize(doc)
 
 
@@ -284,7 +297,7 @@ async def manager_decide_reimbursement(
 @hr_router.get("")
 async def hr_list_reimbursements(
     status: Optional[str] = Query(None),
-    _hr: dict = Depends(require_hr),
+    _hr: dict = Depends(require_hr_or_ceo),
 ):
     """HR sees every reimbursement, optionally filtered by status. Default
     is unfiltered so manager-pending requests are also visible — HR can
@@ -342,6 +355,55 @@ async def hr_decide_reimbursement(
             }
         },
     )
+
+    # On final approval, mirror the claim into office expenses so finance
+    # sees it as a "Reimbursement — <employee>" line item. The status guard
+    # above (must be PENDING_*) means this runs at most once per claim.
+    if data.action == "APPROVE":
+        employee_name = "Employee"
+        try:
+            emp = await db.users.find_one(
+                {"_id": ObjectId(r["userId"])}, {"name": 1}
+            )
+            if emp and emp.get("name"):
+                employee_name = emp["name"]
+        except (InvalidId, TypeError, KeyError):
+            pass
+
+        attachments = r.get("attachments") or []
+        receipt_url = (
+            attachments[0]
+            if attachments and isinstance(attachments[0], str)
+            else None
+        )
+
+        claim_title = r.get("title") or "Reimbursement"
+        desc_bits = [
+            b for b in [
+                f"Claim: {claim_title}",
+                r.get("description") or "",
+                f"Invoice {r['invoiceNumber']}" if r.get("invoiceNumber") else "",
+            ] if b
+        ]
+
+        await db.expenses.insert_one({
+            "title": f"Reimbursement — {employee_name}",
+            "amount": float(r.get("amount") or 0),
+            "category": "Reimbursement",
+            "date": r.get("expenseDate") or now.strftime("%Y-%m-%d"),
+            "description": " · ".join(desc_bits),
+            "receiptUrl": receipt_url,
+            "vendor": r.get("vendorName") or "",
+            "paymentMethod": r.get("paymentMode"),
+            "createdBy": hr_id,
+            # Traceability back to the source claim.
+            "sourceType": "reimbursement",
+            "reimbursementId": id,
+            "employeeId": r.get("userId"),
+            "employeeName": employee_name,
+            "createdAt": now,
+            "updatedAt": now,
+        })
 
     title = (
         "Reimbursement approved"

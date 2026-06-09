@@ -10,7 +10,7 @@ from database import db
 from utils.dependencies import get_current_user_doc
 from utils.email import send_notification_email
 from utils.push import push_to_user
-from utils.notify import create_notification
+from utils.notify import create_notification, notify_user
 from models.task import TaskCreate, TaskUpdate
 
 router = APIRouter()
@@ -372,6 +372,17 @@ async def update_task(
         {"_id": ObjectId(id)},
         {"$set": update},
     )
+
+    # Notify the new assignee on reassignment.
+    new_assignee = update.get("assigneeId")
+    if new_assignee and new_assignee != task.get("assigneeId"):
+        await notify_user(
+            new_assignee,
+            "task_assigned",
+            "Task assigned to you",
+            update.get("title") or task.get("title", ""),
+            {"taskId": id, "teamId": str(team["_id"])},
+        )
 
     return {"message": "Task updated"}
 

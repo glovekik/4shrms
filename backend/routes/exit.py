@@ -15,6 +15,7 @@ from typing import Optional
 from uuid import uuid4
 
 from database import db
+from utils.notify import notify_user, notify_approvers
 from utils.dependencies import (
     get_current_user,
     get_current_user_doc,
@@ -277,6 +278,21 @@ async def submit_resignation(
     }
     result = await db.exits.insert_one(doc)
     doc["_id"] = result.inserted_id
+
+    # Notify the reporting manager + HR that a resignation needs action.
+    submitter = await db.users.find_one(
+        {"_id": ObjectId(user_id)}, {"name": 1}
+    )
+    who = (submitter or {}).get("name") or "An employee"
+    await notify_approvers(
+        user_id,
+        "resignation_submitted",
+        "Resignation submitted",
+        f"{who} submitted a resignation "
+        f"(last working day {data.requestedLastWorkingDay})",
+        {"exitId": str(result.inserted_id)},
+    )
+
     return _serialize(doc)
 
 
@@ -427,6 +443,14 @@ async def decide_resignation(
                 }
             },
         )
+        await notify_user(
+            e["userId"],
+            "resignation_decision",
+            "Resignation approved",
+            f"Your last working day is {data.approvedLastWorkingDay}."
+            + (f" {data.note}" if data.note else ""),
+            {"exitId": str(e["_id"]), "outcome": "APPROVED"},
+        )
         return {"message": "Resignation approved"}
 
     else:  # REJECT
@@ -441,6 +465,13 @@ async def decide_resignation(
                     "updatedAt": now,
                 }
             },
+        )
+        await notify_user(
+            e["userId"],
+            "resignation_decision",
+            "Resignation rejected",
+            data.note or "Your resignation request was rejected.",
+            {"exitId": str(e["_id"]), "outcome": "REJECTED"},
         )
         return {"message": "Resignation rejected"}
 

@@ -12,6 +12,7 @@ from utils.dependencies import (
     require_hr,
 )
 from utils.audit import log_audit
+from utils.notify import notify_user
 from models.project import ProjectCreate, ProjectUpdate
 
 
@@ -134,6 +135,19 @@ async def create_project(
         entity_id=str(result.inserted_id),
         after={"name": name, "code": code},
     )
+
+    # Tell project managers + members they've been added.
+    actor_id = str(hr["_id"])
+    for uid in {*(data.projectManagerIds or []), *(data.memberIds or [])} - {actor_id}:
+        if uid:
+            await notify_user(
+                uid,
+                "project_added",
+                "Added to a project",
+                f"You've been added to the project \"{name}\".",
+                {"projectId": str(result.inserted_id)},
+            )
+
     return {"id": str(result.inserted_id), "message": "Project created"}
 
 
@@ -178,6 +192,27 @@ async def update_project(
         entity_id=id,
         after={k: v for k, v in update.items() if k != "updatedAt"},
     )
+
+    # Notify only people newly added to the project.
+    before = {
+        *(existing.get("projectManagerIds") or []),
+        *(existing.get("memberIds") or []),
+    }
+    after = {
+        *(update.get("projectManagerIds", existing.get("projectManagerIds") or [])),
+        *(update.get("memberIds", existing.get("memberIds") or [])),
+    }
+    pname = update.get("name", existing.get("name", "a project"))
+    for uid in (after - before):
+        if uid:
+            await notify_user(
+                uid,
+                "project_added",
+                "Added to a project",
+                f"You've been added to the project \"{pname}\".",
+                {"projectId": id},
+            )
+
     return {"message": "Project updated"}
 
 

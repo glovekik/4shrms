@@ -226,6 +226,17 @@ async def manager_update_goal(
         update["completedAt"] = datetime.now(timezone.utc)
     update["updatedAt"] = datetime.now(timezone.utc)
     await db.goals.update_one({"_id": oid}, {"$set": update})
+
+    # Let the employee know their manager changed the goal.
+    if g.get("userId"):
+        await notify_user(
+            g["userId"],
+            "goal_updated",
+            "Goal updated",
+            f"Your manager updated the goal: {g.get('title', '')}",
+            {"goalId": id},
+        )
+
     return {"message": "Goal updated"}
 
 
@@ -502,6 +513,17 @@ async def acknowledge_review(
             "updatedAt": now,
         }},
     )
+
+    # Close the loop: tell the manager their report acknowledged the review.
+    if r.get("managerId"):
+        await notify_user(
+            r["managerId"],
+            "review_acknowledged",
+            "Review acknowledged",
+            "Your direct report acknowledged their performance review.",
+            {"reviewId": id},
+        )
+
     return {"message": "Review acknowledged"}
 
 

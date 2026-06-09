@@ -44,32 +44,130 @@ def _write_header(ws, columns: list[str]) -> None:
         cell.font = cell.font.copy(bold=True)
 
 
-# ================= USERS =================
+def _nested(d: dict, *path, default=""):
+    """Safe getter for nested profile fields (e.g. personal.address.city).
+    Returns `default` if any segment is missing or not a dict."""
+    cur: object = d
+    for p in path:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(p)
+        if cur is None:
+            return default
+    return cur if cur is not None else default
+
+
+# ================= USERS / EMPLOYEE DETAILS =================
 @router.get("/users.xlsx")
 async def export_users(
     _hr: dict = Depends(require_hr_or_ceo),
 ):
+    # Load everyone up front so manager + department ids can be resolved to
+    # human-readable names in the sheet.
+    users = [u async for u in db.users.find().sort("name", 1)]
+    name_by_id = {str(u["_id"]): u.get("name", "") for u in users}
+    dept_by_id: dict[str, str] = {}
+    async for d in db.departments.find():
+        dept_by_id[str(d["_id"])] = d.get("name", "")
+
     wb = Workbook()
     ws = wb.active
-    ws.title = "Users"
+    ws.title = "Employees"
     _write_header(ws, [
-        "id", "name", "email", "role", "tag", "employeeCode",
-        "departmentId", "reportingManagerId", "status", "joiningDate",
+        # Identity
+        "Employee Code", "Name", "Legal Name", "Email", "Role",
+        "Designation", "Status", "Joining Date",
+        # Org
+        "Department", "Reporting Manager", "Job Title", "Employee Type",
+        "Work Location", "Work Address",
+        # Contact / personal
+        "Personal Email", "Personal Phone", "Work Phone", "Birthday",
+        "Gender", "Blood Group", "Marital Status", "Place of Birth",
+        # Address
+        "Address Line 1", "Address Line 2", "City", "State",
+        "Pin Code", "Country",
+        # Education
+        "Certification Level", "Field of Study",
+        # Emergency contact
+        "Emergency Contact", "Emergency Relationship", "Emergency Phone",
+        # Statutory
+        "PAN", "UAN", "PF Account", "ESI Number",
+        # Bank (primary account)
+        "Bank Name", "Account Number", "IFSC", "Branch", "Account Holder",
+        # Contract
+        "Contract Start", "Contract End", "Wage Type", "Wage",
+        "Wage Duration",
     ])
-    async for u in db.users.find().sort("name", 1):
+
+    for u in users:
+        # Org ids can live either top-level (legacy) or under `work`.
+        dept_id = _nested(u, "work", "departmentId") or u.get("departmentId", "")
+        mgr_id = (
+            _nested(u, "work", "reportingManagerId")
+            or u.get("reportingManagerId", "")
+        )
+        banks = u.get("bankAccounts") or []
+        bank = banks[0] if banks and isinstance(banks[0], dict) else {}
+
         ws.append([
-            str(u["_id"]),
+            # Identity
+            u.get("employeeCode", ""),
             u.get("name", ""),
+            _nested(u, "personal", "legalName"),
             u.get("email", ""),
             u.get("role", "USER"),
             u.get("tag", ""),
-            u.get("employeeCode", ""),
-            u.get("departmentId", ""),
-            u.get("reportingManagerId", ""),
             u.get("status", ""),
             u.get("joiningDate", ""),
+            # Org
+            dept_by_id.get(str(dept_id), str(dept_id) if dept_id else ""),
+            name_by_id.get(str(mgr_id), ""),
+            _nested(u, "work", "jobTitle") or _nested(u, "work", "jobPosition"),
+            _nested(u, "contract", "employeeType"),
+            _nested(u, "work", "workLocation"),
+            _nested(u, "work", "workAddress"),
+            # Contact / personal
+            _nested(u, "personal", "personalEmail"),
+            _nested(u, "personal", "phone"),
+            u.get("workPhone", ""),
+            _nested(u, "personal", "birthday"),
+            _nested(u, "personal", "gender"),
+            _nested(u, "personal", "bloodGroup"),
+            _nested(u, "personal", "maritalStatus"),
+            _nested(u, "personal", "placeOfBirth"),
+            # Address
+            _nested(u, "personal", "address", "street1"),
+            _nested(u, "personal", "address", "street2"),
+            _nested(u, "personal", "address", "city"),
+            _nested(u, "personal", "address", "state"),
+            _nested(u, "personal", "address", "pinCode"),
+            _nested(u, "personal", "address", "country"),
+            # Education
+            _nested(u, "personal", "education", "certificationLevel"),
+            _nested(u, "personal", "education", "fieldOfStudy"),
+            # Emergency contact
+            _nested(u, "emergencyContact", "contactName"),
+            _nested(u, "emergencyContact", "relationship"),
+            _nested(u, "emergencyContact", "phone"),
+            # Statutory
+            _nested(u, "statutory", "pan"),
+            _nested(u, "statutory", "uan"),
+            _nested(u, "statutory", "pfAccountNumber"),
+            _nested(u, "statutory", "esiNumber"),
+            # Bank (primary account)
+            bank.get("bankName", ""),
+            bank.get("accountNumber", ""),
+            bank.get("ifscCode", ""),
+            bank.get("branch", ""),
+            bank.get("accountHolderName", ""),
+            # Contract
+            _nested(u, "contract", "contractStartDate"),
+            _nested(u, "contract", "contractEndDate"),
+            _nested(u, "contract", "wageType"),
+            _nested(u, "contract", "wage"),
+            _nested(u, "contract", "wageDuration"),
         ])
-    return _xlsx_response(wb, "users.xlsx")
+    return _xlsx_response(wb, "employees.xlsx")
 
 
 # ================= ATTENDANCE =================

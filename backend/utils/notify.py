@@ -8,8 +8,10 @@ back the surrounding business action).
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from bson import ObjectId
+
 from database import db
-from utils.push import push_to_user
+from utils.push import push_to_user, push_to_users
 from utils.realtime import publish as realtime_publish
 
 
@@ -85,3 +87,111 @@ async def notify_user(
         print(f"[notify] push failed for {user_id}: {e}")
 
     await create_notification(user_id, type, title, body, payload)
+
+
+async def notify_approvers(
+    employee_id: str,
+    type: str,
+    title: str,
+    body: str,
+    data: Optional[dict] = None,
+) -> None:
+    """Notify an employee's approvers about a newly-submitted request.
+
+    Recipients = the employee's reporting manager (if assigned) + every
+    active HR user, deduped, never including the submitter. Used by the
+    request/submit endpoints (leave, reimbursement, correction, manual
+    attendance, timesheet) so approvers actually learn there's something
+    pending. Best-effort: never raises.
+    """
+    recipient_ids: set[str] = set()
+
+    try:
+        emp = await db.users.find_one({"_id": ObjectId(employee_id)})
+    except Exception:
+        emp = None
+    # Include the reporting manager only if they're still active — a
+    # terminated manager can't act on the request, and HR (added below)
+    # is the fallback approver anyway.
+    mgr_id = emp.get("reportingManagerId") if emp else None
+    if mgr_id:
+        try:
+            mgr = await db.users.find_one({"_id": ObjectId(str(mgr_id))})
+        except Exception:
+            mgr = None
+        if mgr and mgr.get("status") != "Terminated":
+            recipient_ids.add(str(mgr["_id"]))
+
+    try:
+        async for u in db.users.find(
+            {"role": "HR", "status": {"$ne": "Terminated"}},
+            {"_id": 1},
+        ):
+            recipient_ids.add(str(u["_id"]))
+    except Exception as e:
+        print(f"[notify] approver HR lookup failed: {e}")
+
+    recipient_ids.discard(str(employee_id))
+
+    for rid in recipient_ids:
+        await notify_user(rid, type, title, body, data)
+
+
+async def notify_hr(
+    type: str,
+    title: str,
+    body: str,
+    data: Optional[dict] = None,
+) -> None:
+    """Notify every active HR user. For events HR owns (e.g. an asset
+    issue reported by an employee). Best-effort: never raises."""
+    try:
+        ids = [
+            str(u["_id"])
+            async for u in db.users.find(
+                {"role": "HR", "status": {"$ne": "Terminated"}}, {"_id": 1}
+            )
+        ]
+    except Exception as e:
+        print(f"[notify] HR lookup failed: {e}")
+        return
+    for uid in ids:
+        await notify_user(uid, type, title, body, data)
+
+
+async def notify_all_active(
+    type: str,
+    title: str,
+    body: str,
+    data: Optional[dict] = None,
+    exclude_id: Optional[str] = None,
+) -> None:
+    """Broadcast to every active (non-terminated) user — one bulk push +
+    an in-app bell row each. For company-wide announcements (e.g. a newly
+    declared holiday). Best-effort: never raises.
+    """
+    ids: list[str] = []
+    try:
+        async for u in db.users.find(
+            {"status": {"$ne": "Terminated"}}, {"_id": 1}
+        ):
+            uid = str(u["_id"])
+            if exclude_id and uid == exclude_id:
+                continue
+            ids.append(uid)
+    except Exception as e:
+        print(f"[notify] broadcast user lookup failed: {e}")
+        return
+
+    if not ids:
+        return
+
+    payload = (data or {}).copy()
+    payload.setdefault("type", type)
+    try:
+        await push_to_users(ids, title, body, payload)
+    except Exception as e:
+        print(f"[notify] broadcast push failed: {e}")
+
+    for uid in ids:
+        await create_notification(uid, type, title, body, data)

@@ -13,13 +13,14 @@ from utils.dependencies import (
     get_current_user,
     get_current_user_doc,
     require_hr,
+    require_hr_or_ceo,
     require_manager_or_hr,
     can_decide_for_employee,
 )
 from utils.email import send_notification_email
 from utils.push import push_to_user
 from utils.audit import log_audit
-from utils.notify import create_notification
+from utils.notify import create_notification, notify_approvers
 from models.correction import (
     CorrectionRequestCreate,
     CorrectionDecision,
@@ -338,6 +339,17 @@ async def create_correction_request(
     result = await db.correction_requests.insert_one(doc)
     doc["_id"] = result.inserted_id
 
+    # Notify approvers (reporting manager + HR) of the pending correction.
+    who_doc = await db.users.find_one({"_id": ObjectId(user_id)}, {"name": 1})
+    who = (who_doc or {}).get("name") or "An employee"
+    await notify_approvers(
+        user_id,
+        "correction_requests",
+        "New attendance correction",
+        f"{who} requested a correction for {attendance.get('date', 'a record')}",
+        {"correctionId": str(result.inserted_id), "attendanceId": id},
+    )
+
     return _serialize(doc)
 
 
@@ -378,7 +390,7 @@ async def list_my_correction_requests(
 @hr_router.get("")
 async def list_correction_requests(
     status: Optional[str] = Query(None),
-    _hr: dict = Depends(require_hr),
+    _hr: dict = Depends(require_hr_or_ceo),
 ):
 
     query: dict = {}
