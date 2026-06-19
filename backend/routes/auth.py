@@ -25,7 +25,8 @@ from bson import ObjectId
 from database import db
 
 from utils.dependencies import (
-    get_current_user
+    get_current_user,
+    get_current_user_doc,
 )
 
 from utils.email import send_notification_email
@@ -814,3 +815,41 @@ async def reset_password(data: ResetPasswordRequest):
     )
 
     return {"message": "Password reset successful"}
+
+
+# ================= CHANGE PASSWORD (logged-in) =================
+class ChangePasswordModel(BaseModel):
+    currentPassword: str
+    newPassword: str
+
+
+@router.post("/change-password")
+async def change_password(
+    data: ChangePasswordModel,
+    user: dict = Depends(get_current_user_doc),
+):
+    """Self-service password change for the signed-in user. Unlike the
+    email-code reset flow, this proves identity with the current password,
+    so it needs no token round-trip."""
+    if len(data.newPassword) < 8:
+        raise HTTPException(
+            400,
+            "Password must be at least 8 characters",
+        )
+
+    if not verify_password(data.currentPassword, user["password"]):
+        raise HTTPException(400, "Current password is incorrect")
+
+    if data.newPassword == data.currentPassword:
+        raise HTTPException(
+            400,
+            "New password must be different from the current one",
+        )
+
+    now = datetime.now(timezone.utc)
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"password": hash_password(data.newPassword), "updatedAt": now}},
+    )
+
+    return {"message": "Password changed successfully"}

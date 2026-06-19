@@ -23,6 +23,11 @@ from utils.dependencies import (
 
 router = APIRouter()
 
+# Statuses that count as "present" for the day. Kept in sync with
+# reports.py — COMPLETED (auto-checkout / manual attendance) and HALF_DAY
+# are present-equivalent, so omitting them undercounts attendance.
+PRESENT_STATUSES = ["CHECKED_IN", "PRESENT", "LATE", "HALF_DAY", "COMPLETED"]
+
 
 def _today_str() -> str:
     return datetime.now().strftime("%Y-%m-%d")
@@ -56,7 +61,7 @@ async def hr_dashboard(
     # Today's attendance counters
     present_today = await db.attendance.count_documents({
         "date": today,
-        "status": {"$in": ["CHECKED_IN", "PRESENT", "LATE", "HALF_DAY"]},
+        "status": {"$in": PRESENT_STATUSES},
     })
     absent_today = await db.attendance.count_documents({
         "date": today,
@@ -595,7 +600,10 @@ async def my_dashboard(
         if counted_days > 0 else None
     )
 
-    # Task completion rate (rolling 30d).
+    # Task completion rate (rolling 30d). Numerator and denominator must
+    # cover the SAME population — tasks created in the window — otherwise a
+    # task created earlier but completed recently inflates the rate past
+    # 100%. So we ask: of tasks created in the last 30d, how many are done.
     thirty_days_ago = datetime.now() - timedelta(days=30)
     total_my_30d = await db.tasks.count_documents({
         "assigneeId": user_id,
@@ -603,8 +611,8 @@ async def my_dashboard(
     })
     completed_my_30d = await db.tasks.count_documents({
         "assigneeId": user_id,
+        "createdAt": {"$gte": thirty_days_ago},
         "status": "COMPLETED",
-        "completedAt": {"$gte": thirty_days_ago},
     })
     task_completion_rate_pct = (
         round((completed_my_30d / total_my_30d) * 100, 1)
@@ -650,4 +658,71 @@ async def my_dashboard(
         "myTaskCompletionRatePct30d": task_completion_rate_pct,
         "pendingRequestsTotal": pending_requests_total,
         "requiredDocCompletenessPct": required_completeness_pct,
+    }
+
+
+# ================= UPCOMING (sidebar widget) =================
+@router.get("/upcoming")
+async def upcoming_events(
+    _user: dict = Depends(get_current_user_doc),
+):
+    """Next holidays and employee birthdays for the sidebar widget.
+    Available to every authenticated user."""
+    today = datetime.now().date()
+    today_str = today.strftime("%Y-%m-%d")
+
+    # Next holidays (today onward), soonest first.
+    holidays: list[dict] = []
+    async for h in (
+        db.holidays.find({"date": {"$gte": today_str}})
+        .sort("date", 1)
+        .limit(5)
+    ):
+        hd = h.get("date")
+        try:
+            d = datetime.strptime(hd, "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            continue
+        holidays.append({
+            "name": h.get("name"),
+            "date": hd,
+            "daysUntil": (d - today).days,
+        })
+
+    # Upcoming birthdays in the next 30 days (match month + day, ignoring
+    # year). days_map maps each (month, day) to how many days away it is so
+    # we can sort and label without re-deriving per user.
+    horizon = 30
+    targets = _upcoming_birthdays_match(horizon)
+    days_map: dict[tuple, int] = {}
+    for n in range(horizon + 1):
+        d = today + timedelta(days=n)
+        days_map.setdefault((d.month, d.day), n)
+
+    birthdays: list[dict] = []
+    async for u in db.users.find({
+        "personal.birthday": {"$exists": True},
+        "status": {"$ne": "Terminated"},
+    }):
+        bday = u.get("personal", {}).get("birthday")
+        if not bday:
+            continue
+        try:
+            b = datetime.strptime(bday, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if {"month": b.month, "day": b.day} in targets:
+            birthdays.append({
+                "id": str(u["_id"]),
+                "name": u.get("name"),
+                "birthday": bday,
+                "daysUntil": days_map.get((b.month, b.day), 0),
+                "profilePictureUrl": u.get("profilePictureUrl"),
+            })
+
+    birthdays.sort(key=lambda x: x["daysUntil"])
+
+    return {
+        "holidays": holidays,
+        "birthdays": birthdays,
     }
