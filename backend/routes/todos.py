@@ -94,6 +94,10 @@ async def update_todo(
         v = getattr(data, field)
         if v is not None:
             update[field] = v
+    # If the reminder time was (re)set, clear the sent flag so the
+    # scheduler will fire the new reminder.
+    if data.reminderAt is not None:
+        update["reminderSent"] = False
 
     result = await db.todos.update_one(
         {"_id": oid, "userId": user_id},

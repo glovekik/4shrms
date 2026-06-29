@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from database import db
 from utils.attendance_rules import is_weekend
@@ -488,6 +489,82 @@ async def hr_daily_attendance_brief() -> None:
     )
 
 
+# ================= TO-DO REMINDERS =================
+def _parse_reminder_dt(value) -> "datetime | None":
+    """Parse a stored reminderAt into an aware UTC datetime.
+
+    reminderAt is stored as the ISO string the client sent, which may end
+    in 'Z', carry an offset, or (older rows) be naive. Normalise all of
+    them to aware UTC so the <= now comparison is correct."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+async def todo_reminder_dispatch() -> None:
+    """Runs every minute. Fires a push + in-app notification for any OPEN
+    to-do whose reminderAt has arrived and hasn't been sent yet, then
+    stamps reminderSent so it never double-fires.
+
+    This is the server-side companion to the client's local reminder — it
+    delivers even when the app is closed or the user is on the web.
+    """
+    from utils.notify import notify_user
+
+    now = datetime.now(timezone.utc)
+
+    candidates = []
+    async for t in db.todos.find({
+        "status": {"$ne": "DONE"},
+        "reminderAt": {"$ne": None},
+        "reminderSent": {"$ne": True},
+    }):
+        candidates.append(t)
+
+    sent = 0
+    for t in candidates:
+        due = _parse_reminder_dt(t.get("reminderAt"))
+        if not due or due > now:
+            continue
+
+        user_id = t.get("userId")
+        title = "To-do reminder"
+        body = t.get("title") or "You have a to-do due."
+
+        # Stamp first so a notify failure can't cause an infinite re-fire
+        # loop; the worst case is a missed reminder, not a notification
+        # storm.
+        await db.todos.update_one(
+            {"_id": t["_id"]},
+            {"$set": {"reminderSent": True, "updatedAt": now}},
+        )
+
+        if user_id:
+            try:
+                await notify_user(
+                    user_id,
+                    "todo_reminder",
+                    title,
+                    body,
+                    {"todoId": str(t["_id"])},
+                )
+                sent += 1
+            except Exception as e:
+                print(f"[scheduler] todo_reminder notify failed: {e}")
+
+    if sent:
+        print(f"[scheduler] todo_reminder_dispatch: sent {sent} reminder(s)")
+
+
 # ================= LIFECYCLE =================
 def start_scheduler() -> None:
     scheduler.add_job(
@@ -524,6 +601,15 @@ def start_scheduler() -> None:
         hr_daily_attendance_brief,
         CronTrigger(day_of_week="mon-sat", hour=11, minute=0),
         id="hr_daily_attendance_brief",
+        replace_existing=True,
+    )
+
+    # Every minute: deliver any due to-do reminders (server-side, so they
+    # fire even when the app is closed / on web).
+    scheduler.add_job(
+        todo_reminder_dispatch,
+        IntervalTrigger(minutes=1),
+        id="todo_reminder_dispatch",
         replace_existing=True,
     )
 

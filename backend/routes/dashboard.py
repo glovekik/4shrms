@@ -81,7 +81,7 @@ async def hr_dashboard(
     })
     # Per-queue counts so the HR Admin tiles can each show their own
     # badge without an extra round-trip.
-    pending_reimb_hr = await db.reimbursements.count_documents({
+    pending_reimb_hr = await db.reimbursement_requests.count_documents({
         "status": "PENDING_HR",
     })
     pending_timesheet_hr = await db.timesheets.count_documents({
@@ -367,7 +367,7 @@ async def manager_dashboard(
     )
 
     # Pending approvals total at this manager (everything queued for them).
-    pending_reimb = await db.reimbursements.count_documents({
+    pending_reimb = await db.reimbursement_requests.count_documents({
         "status": "PENDING_MANAGER",
         "userId": {"$in": report_ids},
     })
@@ -621,7 +621,7 @@ async def my_dashboard(
 
     # Pending requests — per type so the tiles can each show their own
     # badge — and total for the KPI strip.
-    pending_reimb_me = await db.reimbursements.count_documents({
+    pending_reimb_me = await db.reimbursement_requests.count_documents({
         "userId": user_id,
         "status": {"$in": ["PENDING_MANAGER", "PENDING_HR"]},
     })
@@ -695,9 +695,11 @@ async def upcoming_events(
     horizon = 30
     targets = _upcoming_birthdays_match(horizon)
     days_map: dict[tuple, int] = {}
+    occ_map: dict[tuple, "datetime.date"] = {}
     for n in range(horizon + 1):
         d = today + timedelta(days=n)
         days_map.setdefault((d.month, d.day), n)
+        occ_map.setdefault((d.month, d.day), d)
 
     birthdays: list[dict] = []
     async for u in db.users.find({
@@ -722,7 +724,56 @@ async def upcoming_events(
 
     birthdays.sort(key=lambda x: x["daysUntil"])
 
+    # Upcoming work anniversaries in the next 30 days. Same month+day match
+    # as birthdays, but the user must have completed >= 1 year (so a brand
+    # new joiner's first joining-date doesn't show as an "anniversary").
+    anniversaries: list[dict] = []
+    # New joiners — anyone who joined within the last 30 days.
+    new_joiners: list[dict] = []
+    thirty_days_ago_str = (today - timedelta(days=30)).strftime("%Y-%m-%d")
+
+    async for u in db.users.find({
+        "joiningDate": {"$exists": True, "$ne": None},
+        "status": {"$ne": "Terminated"},
+    }):
+        jd = u.get("joiningDate")
+        if not jd:
+            continue
+        try:
+            j = datetime.strptime(jd, "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            continue
+
+        # New joiner (within the last 30 days, joined today or earlier).
+        if thirty_days_ago_str <= jd <= today_str:
+            new_joiners.append({
+                "id": str(u["_id"]),
+                "name": u.get("name"),
+                "joiningDate": jd,
+                "daysAgo": (today - j).days,
+                "profilePictureUrl": u.get("profilePictureUrl"),
+            })
+
+        # Upcoming anniversary.
+        if {"month": j.month, "day": j.day} in targets:
+            occ = occ_map.get((j.month, j.day))
+            years = (occ.year - j.year) if occ else 0
+            if years >= 1:
+                anniversaries.append({
+                    "id": str(u["_id"]),
+                    "name": u.get("name"),
+                    "joiningDate": jd,
+                    "years": years,
+                    "daysUntil": days_map.get((j.month, j.day), 0),
+                    "profilePictureUrl": u.get("profilePictureUrl"),
+                })
+
+    anniversaries.sort(key=lambda x: x["daysUntil"])
+    new_joiners.sort(key=lambda x: x["daysAgo"])
+
     return {
         "holidays": holidays,
         "birthdays": birthdays,
+        "anniversaries": anniversaries,
+        "newJoiners": new_joiners,
     }

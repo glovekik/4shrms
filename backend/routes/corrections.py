@@ -24,6 +24,7 @@ from utils.notify import create_notification, notify_approvers
 from models.correction import (
     CorrectionRequestCreate,
     CorrectionDecision,
+    CorrectionBulkDecision,
 )
 
 
@@ -578,7 +579,102 @@ async def _decide_correction_internal(
     return {"message": "Correction rejected"}
 
 
+async def _bulk_decide_corrections(
+    ids: list[str],
+    decider: dict,
+    action: str,
+    note: str,
+    scope_check: bool,
+) -> dict:
+    """Apply the same APPROVE/REJECT decision to many correction requests.
+
+    Each id is processed independently so one bad/already-decided row
+    doesn't abort the rest — the per-item outcome is collected and a
+    summary is returned. `scope_check=True` enforces the manager
+    direct-report rule per item (HR passes False).
+    """
+    results: list[dict] = []
+    approved = 0
+    failed = 0
+
+    for rid in ids:
+        try:
+            oid = ObjectId(rid)
+        except (InvalidId, TypeError):
+            failed += 1
+            results.append({"id": rid, "ok": False, "error": "Invalid id"})
+            continue
+
+        req = await db.correction_requests.find_one({"_id": oid})
+        if not req:
+            failed += 1
+            results.append({"id": rid, "ok": False, "error": "Not found"})
+            continue
+        if req.get("status") != "PENDING":
+            failed += 1
+            results.append({
+                "id": rid,
+                "ok": False,
+                "error": f"Already {req.get('status')}",
+            })
+            continue
+
+        if scope_check:
+            try:
+                employee = await db.users.find_one(
+                    {"_id": ObjectId(req["userId"])}
+                )
+            except (InvalidId, TypeError, KeyError):
+                employee = None
+            if not employee or not can_decide_for_employee(decider, employee):
+                failed += 1
+                results.append({
+                    "id": rid,
+                    "ok": False,
+                    "error": "Not one of your direct reports",
+                })
+                continue
+
+        try:
+            await _decide_correction_internal(
+                oid,
+                req,
+                decider,
+                CorrectionDecision(action=action, note=note or ""),
+            )
+            approved += 1
+            results.append({"id": rid, "ok": True})
+        except HTTPException as e:
+            failed += 1
+            results.append({"id": rid, "ok": False, "error": e.detail})
+        except Exception as e:  # noqa: BLE001 - keep the batch going
+            failed += 1
+            results.append({"id": rid, "ok": False, "error": str(e)})
+
+    verb = "approved" if action == "APPROVE" else "rejected"
+    return {
+        "message": f"{approved} {verb}, {failed} failed",
+        "total": len(ids),
+        "succeeded": approved,
+        "failed": failed,
+        "results": results,
+    }
+
+
 # ================= HR: DECIDE =================
+@hr_router.post("/bulk-decide")
+async def hr_bulk_decide_correction_requests(
+    data: CorrectionBulkDecision,
+    hr: dict = Depends(require_hr),
+):
+    """Approve/reject many requests at once (HR scope — any request)."""
+    if not data.ids:
+        raise HTTPException(400, "No correction ids provided")
+    return await _bulk_decide_corrections(
+        data.ids, hr, data.action, data.note or "", scope_check=False,
+    )
+
+
 @hr_router.post("/{id}/decide")
 async def decide_correction_request(
     id: str,
@@ -642,6 +738,23 @@ async def list_correction_requests_for_my_reports(
         )
         for r in raw
     ]
+
+
+@manager_router.post("/bulk-decide")
+async def manager_bulk_decide_correction_requests(
+    data: CorrectionBulkDecision,
+    actor: dict = Depends(require_manager_or_hr),
+):
+    """Approve/reject many requests at once. HR may act on any request;
+    a manager is restricted to their own direct reports (enforced per
+    item, so out-of-scope ids are reported as failed rather than 403ing
+    the whole batch)."""
+    if not data.ids:
+        raise HTTPException(400, "No correction ids provided")
+    scope = actor.get("role") != "HR"
+    return await _bulk_decide_corrections(
+        data.ids, actor, data.action, data.note or "", scope_check=scope,
+    )
 
 
 @manager_router.post("/{id}/decide")

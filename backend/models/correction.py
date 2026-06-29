@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional, Literal
+from typing import Optional, Literal, List
 
 
 AttendanceTypeLiteral = Literal["OFFICE", "WFH", "LEAVE", "HOLIDAY"]
@@ -33,3 +33,18 @@ class CorrectionDecision(BaseModel):
     overrideCheckOut: Optional[str] = None
     overrideAttendanceType: Optional[AttendanceTypeLiteral] = None
     overrideWorkNotes: Optional[str] = None
+
+
+class CorrectionBulkDecision(BaseModel):
+    """Approve/reject many correction requests in one call.
+
+    `ids` is the explicit list of correction-request ids to act on
+    (used for both "approve selected" and "approve all" — the client
+    passes whichever set it wants). Field overrides are intentionally
+    NOT supported in bulk: each request keeps whatever the employee
+    asked for. A per-item result list is returned so the UI can report
+    partial success.
+    """
+    ids: List[str]
+    action: Literal["APPROVE", "REJECT"]
+    note: Optional[str] = ""
