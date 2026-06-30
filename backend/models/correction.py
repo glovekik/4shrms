@@ -22,6 +22,14 @@ class CorrectionRequestCreate(BaseModel):
     requestedWorkNotes: Optional[str] = None
 
 
+class CorrectionForDateCreate(CorrectionRequestCreate):
+    """Correction for a day that has NO existing attendance row (a missed
+    day). Same fields as CorrectionRequestCreate plus the target `date`.
+    The route creates a placeholder ABSENT row for that date and attaches
+    the pending request to it, so the normal approve flow can stamp it."""
+    date: str  # YYYY-MM-DD — the missed day with no existing record
+
+
 class CorrectionDecision(BaseModel):
     action: Literal["APPROVE", "REJECT"]
     note: Optional[str] = ""

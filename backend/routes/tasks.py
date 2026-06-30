@@ -168,7 +168,7 @@ async def my_tasks(
             )
         query["createdAt"] = {"$lt": before_dt}
 
-    tasks = []
+    raw = []
 
     cursor = (
         db.tasks.find(query)
@@ -177,7 +177,19 @@ async def my_tasks(
     )
 
     async for t in cursor:
-        tasks.append(_serialize(t))
+        raw.append(t)
+
+    # Resolve the assigner (createdBy) for each task so the list can show
+    # "Assigned by <name>" without a per-row round-trip.
+    creator_map = await _get_user_basics(
+        t.get("createdBy") for t in raw
+    )
+
+    tasks = []
+    for t in raw:
+        s = _serialize(t)
+        s["createdByUser"] = creator_map.get(t.get("createdBy"))
+        tasks.append(s)
 
     return tasks
 

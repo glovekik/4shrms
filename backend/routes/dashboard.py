@@ -14,6 +14,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from database import db
+from config import WEEKEND_DAYS
 from utils.dependencies import (
     get_current_user_doc,
     require_hr,
@@ -42,6 +43,59 @@ def _upcoming_birthdays_match(days_ahead: int = 14) -> list[dict]:
         d = today + timedelta(days=n)
         out.append({"month": d.month, "day": d.day})
     return out
+
+
+async def _working_days_in_range(start: str, end: str) -> set[str]:
+    """YYYY-MM-DD strings for every working day in [start, end] inclusive.
+
+    A working day is a weekday not in WEEKEND_DAYS and not a holiday. This
+    is the denominator for attendance-rate KPIs: counting working days
+    (rather than "attendance rows that happen to exist") means days an
+    employee has no row for — i.e. was absent — correctly count against the
+    rate. The old denominator was the row count, which structurally pinned
+    every rate at 100% because absent days create no row.
+    """
+    try:
+        s = datetime.strptime(start, "%Y-%m-%d").date()
+        e = datetime.strptime(end, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return set()
+    days: set[str] = set()
+    n = 0
+    while True:
+        d = s + timedelta(days=n)
+        if d > e:
+            break
+        if d.weekday() not in WEEKEND_DAYS:
+            days.add(d.strftime("%Y-%m-%d"))
+        n += 1
+    # Drop holidays so they don't count as expected working days.
+    if days:
+        async for h in db.holidays.find(
+            {"date": {"$in": list(days)}}, {"date": 1}
+        ):
+            days.discard(h.get("date"))
+    return days
+
+
+async def _present_working_days(
+    user_ids: list[str], start: str, end: str, working_days: set[str]
+) -> float:
+    """Sum of present-equivalent attendance over working days for the given
+    users; HALF_DAY counts as 0.5. Restricting to `working_days` keeps the
+    numerator on the same universe as the denominator, so weekend/holiday
+    work can't push a rate over 100%."""
+    if not working_days or not user_ids:
+        return 0.0
+    present = 0.0
+    async for r in db.attendance.find({
+        "userId": {"$in": user_ids},
+        "date": {"$gte": start, "$lte": end},
+        "status": {"$in": PRESENT_STATUSES},
+    }):
+        if r.get("date") in working_days:
+            present += 0.5 if r.get("status") == "HALF_DAY" else 1.0
+    return present
 
 
 # ================= HR =================
@@ -331,24 +385,20 @@ async def manager_dashboard(
 
     # ===== KPIs =====
 
-    # MTD attendance rate for the team. Numerator: days in this month
-    # where a report has a non-ABSENT row. Denominator: working-day
-    # estimate = team_size * elapsed_workdays_this_month. We use a
-    # simpler proxy here — denominator is the count of all rows in the
-    # window — to stay accurate against the data we actually store.
+    # MTD attendance rate for the team. Denominator = elapsed working days
+    # this month (weekdays minus holidays) × team size; numerator =
+    # present-equivalent days across the team (HALF_DAY = 0.5). Using working
+    # days rather than "rows that exist" stops the rate from being pinned at
+    # 100% when absent days simply have no attendance row.
     month_start = datetime.now().replace(day=1).strftime("%Y-%m-%d")
-    total_mtd = await db.attendance.count_documents({
-        "userId": {"$in": report_ids},
-        "date": {"$gte": month_start, "$lte": today},
-    })
-    present_mtd = await db.attendance.count_documents({
-        "userId": {"$in": report_ids},
-        "date": {"$gte": month_start, "$lte": today},
-        "status": {"$nin": ["ABSENT"]},
-    })
+    working_days = await _working_days_in_range(month_start, today)
+    denom_team = len(working_days) * len(report_ids)
+    present_mtd = await _present_working_days(
+        report_ids, month_start, today, working_days
+    )
     team_attendance_rate_pct = (
-        round((present_mtd / total_mtd) * 100, 1)
-        if total_mtd > 0 else None
+        round((present_mtd / denom_team) * 100, 1)
+        if denom_team > 0 else None
     )
 
     # WFH ratio today — among today's rows for the team.
@@ -547,20 +597,18 @@ async def my_dashboard(
 
     month_start = datetime.now().replace(day=1).strftime("%Y-%m-%d")
 
-    # Personal attendance rate MTD. Denominator = all attendance rows
-    # for me this month; numerator = non-ABSENT rows. Skipped when zero.
-    my_mtd_total = await db.attendance.count_documents({
-        "userId": user_id,
-        "date": {"$gte": month_start, "$lte": today},
-    })
-    my_mtd_present = await db.attendance.count_documents({
-        "userId": user_id,
-        "date": {"$gte": month_start, "$lte": today},
-        "status": {"$nin": ["ABSENT"]},
-    })
+    # Personal attendance rate MTD. Denominator = elapsed working days this
+    # month (weekdays minus holidays); numerator = present-equivalent days
+    # (HALF_DAY = 0.5). Counting working days rather than existing rows means
+    # days with no attendance row register as absent instead of dropping out
+    # and pinning the rate at 100%.
+    working_days = await _working_days_in_range(month_start, today)
+    my_mtd_present = await _present_working_days(
+        [user_id], month_start, today, working_days
+    )
     attendance_rate_pct = (
-        round((my_mtd_present / my_mtd_total) * 100, 1)
-        if my_mtd_total > 0 else None
+        round((my_mtd_present / len(working_days)) * 100, 1)
+        if working_days else None
     )
 
     # On-time check-in rate MTD — only rows where I actually checked in.
@@ -580,25 +628,34 @@ async def my_dashboard(
         if my_mtd_checkins > 0 else None
     )
 
-    # Avg hours/day this week + overtime this month.
+    # Avg hours/day this week — queried over its own week range, not the
+    # month range. The current week can start in the previous month (the
+    # first few days of a new month), so scoping to month_start would drop
+    # those earlier week-days and understate the average.
     week_start = (
         datetime.now() - timedelta(days=datetime.now().weekday())
     ).strftime("%Y-%m-%d")
     total_hours_week = 0.0
     counted_days = 0
+    async for r in db.attendance.find({
+        "userId": user_id,
+        "date": {"$gte": week_start, "$lte": today},
+        "hoursWorked": {"$gt": 0},
+    }):
+        total_hours_week += float(r.get("hoursWorked", 0))
+        counted_days += 1
+    avg_hours_week = (
+        round(total_hours_week / counted_days, 2)
+        if counted_days > 0 else None
+    )
+
+    # Overtime this month — accumulated over the month range.
     overtime_month = 0.0
     async for r in db.attendance.find({
         "userId": user_id,
         "date": {"$gte": month_start, "$lte": today},
     }):
-        if r.get("date", "") >= week_start and r.get("hoursWorked", 0) > 0:
-            total_hours_week += float(r.get("hoursWorked", 0))
-            counted_days += 1
         overtime_month += float(r.get("overtimeHours", 0) or 0)
-    avg_hours_week = (
-        round(total_hours_week / counted_days, 2)
-        if counted_days > 0 else None
-    )
 
     # Task completion rate (rolling 30d). Numerator and denominator must
     # cover the SAME population — tasks created in the window — otherwise a

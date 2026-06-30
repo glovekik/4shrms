@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from bson import ObjectId
 from bson.errors import InvalidId
+from pymongo.errors import DuplicateKeyError
 
 from datetime import datetime, timezone
 
@@ -23,6 +24,7 @@ from utils.audit import log_audit
 from utils.notify import create_notification, notify_approvers
 from models.correction import (
     CorrectionRequestCreate,
+    CorrectionForDateCreate,
     CorrectionDecision,
     CorrectionBulkDecision,
 )
@@ -218,6 +220,139 @@ async def _get_attendance_summaries(att_ids) -> dict:
             ),
         }
     return result
+
+
+# ================= USER: CREATE REQUEST FOR A MISSED DAY =================
+# For a previous day that has NO attendance record. The client can't pass an
+# attendanceId because none exists, so it posts the date here. We create (or
+# reuse) a placeholder ABSENT row for that date and attach a pending
+# correction to it — the standard approve flow then stamps the real times.
+# Registered before /{id}/correction-request; the literal path can't collide
+# with that template, but ordering keeps intent clear.
+@user_router.post("/correction-requests/for-date")
+async def create_correction_request_for_date(
+    data: CorrectionForDateCreate,
+    user_id: str = Depends(get_current_user),
+):
+    date_str = (data.date or "").strip()
+    if not date_str:
+        raise HTTPException(400, "date is required")
+    try:
+        datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(400, "date must be YYYY-MM-DD")
+
+    reason = (data.reason or "").strip()
+    if not reason:
+        raise HTTPException(400, "Reason is required")
+
+    requested_check_in = (
+        _parse_iso(data.requestedCheckIn, "requestedCheckIn")
+        if data.requestedCheckIn else None
+    )
+    requested_check_out = (
+        _parse_iso(data.requestedCheckOut, "requestedCheckOut")
+        if data.requestedCheckOut else None
+    )
+    if (
+        requested_check_in
+        and requested_check_out
+        and requested_check_out < requested_check_in
+    ):
+        raise HTTPException(
+            400, "Requested check-out cannot be before check-in",
+        )
+
+    requested_type = data.requestedAttendanceType or None
+    requested_notes = (
+        (data.requestedWorkNotes or "").strip()
+        if data.requestedWorkNotes is not None else None
+    )
+
+    # Find or create the attendance row for (user, date). A row may already
+    # exist if the absent-marker cron stamped this day ABSENT — reuse it
+    # rather than colliding with the unique (userId, date) index.
+    attendance = await db.attendance.find_one(
+        {"userId": user_id, "date": date_str}
+    )
+    if attendance:
+        att_id = str(attendance["_id"])
+    else:
+        now0 = datetime.now(timezone.utc)
+        placeholder = {
+            "userId": user_id,
+            "date": date_str,
+            "attendanceType": requested_type or "OFFICE",
+            "status": "ABSENT",
+            "isLate": False,
+            "checkIn": None,
+            "checkOut": None,
+            "workNotes": "",
+            "hoursWorked": 0.0,
+            "overtimeHours": 0.0,
+            "createdAt": now0,
+            "updatedAt": now0,
+            # Marks a row that exists only to carry a pending correction for
+            # a missed day; the approve flow overwrites it with real times.
+            "placeholderForCorrection": True,
+        }
+        try:
+            res = await db.attendance.insert_one(placeholder)
+            att_id = str(res.inserted_id)
+        except DuplicateKeyError:
+            # Race: a row was created between the find and the insert.
+            attendance = await db.attendance.find_one(
+                {"userId": user_id, "date": date_str}
+            )
+            if not attendance:
+                raise HTTPException(
+                    500, "Could not create attendance row for the date",
+                )
+            att_id = str(attendance["_id"])
+
+    # Block duplicate pending requests for the same record.
+    existing = await db.correction_requests.find_one({
+        "attendanceId": att_id,
+        "userId": user_id,
+        "status": "PENDING",
+    })
+    if existing:
+        raise HTTPException(
+            400,
+            "A pending correction request already exists for this date",
+        )
+
+    now = datetime.now(timezone.utc)
+    doc = {
+        "userId": user_id,
+        "attendanceId": att_id,
+        "requestedDate": None,
+        "requestedCheckIn": requested_check_in,
+        "requestedCheckOut": requested_check_out,
+        "requestedAttendanceType": requested_type,
+        "requestedWorkNotes": requested_notes,
+        "reason": reason,
+        "status": "PENDING",
+        "decisionNote": "",
+        "decidedBy": None,
+        "decidedAt": None,
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    result = await db.correction_requests.insert_one(doc)
+    doc["_id"] = result.inserted_id
+
+    who_doc = await db.users.find_one({"_id": ObjectId(user_id)}, {"name": 1})
+    who = (who_doc or {}).get("name") or "An employee"
+    await notify_approvers(
+        user_id,
+        "correction_requests",
+        "New attendance correction",
+        f"{who} requested attendance for {date_str}",
+        {"correctionId": str(result.inserted_id), "attendanceId": att_id},
+    )
+
+    return _serialize(doc)
 
 
 # ================= USER: CREATE REQUEST =================
