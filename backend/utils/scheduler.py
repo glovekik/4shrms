@@ -675,7 +675,51 @@ async def todo_reminder_dispatch() -> None:
 
 
 # ================= LIFECYCLE =================
+# Held for the process lifetime once acquired — never closed on purpose, so
+# the OS releases it only when this worker exits.
+_scheduler_lock_fd = None
+
+
+def _acquire_singleton_lock() -> bool:
+    """Elect a single scheduler owner across gunicorn workers.
+
+    The production image runs WEB_CONCURRENCY gunicorn workers that share one
+    filesystem, so without this every worker would boot its own APScheduler
+    and each job would fire once *per worker* — e.g. duplicate check-in /
+    check-out reminder pushes. An flock on a shared file lets exactly one
+    worker win; it's released automatically if that worker dies, so a
+    respawned worker can take the scheduler over.
+
+    On platforms without fcntl (Windows dev) or if the lock can't be taken
+    for an unexpected reason, returns True so a single dev process still
+    schedules normally.
+    """
+    global _scheduler_lock_fd
+    try:
+        import fcntl
+    except ImportError:
+        return True  # Windows dev — single process, no contention.
+
+    path = os.getenv("SCHEDULER_LOCK_FILE", "/tmp/hrms-scheduler.lock")
+    try:
+        fd = open(path, "w")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False  # Another worker already owns the scheduler.
+    except OSError:
+        return True  # Can't lock (e.g. odd FS) — better to run than not.
+    _scheduler_lock_fd = fd
+    return True
+
+
 def start_scheduler() -> None:
+    if not _acquire_singleton_lock():
+        print(
+            "[scheduler] another worker owns the scheduler — skipping start "
+            "in this worker"
+        )
+        return
+
     scheduler.add_job(
         auto_close_attendance,
         CronTrigger(hour=0, minute=1),
