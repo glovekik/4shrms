@@ -45,9 +45,14 @@ FROM python:3.12-slim AS runtime
 # Runtime-only system deps:
 #   curl — used by the HEALTHCHECK below and handy for shell debugging.
 #   libffi/libssl runtime libs are already present in the slim base.
+#   tzdata — so the scheduler's cron jobs (10:00 check-in / 18:00 check-out
+#            reminders, midnight roll-ups) fire at the right wall-clock time.
+#            Without it a container runs in UTC and every time-based job is
+#            5.5h off IST.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         curl \
+        tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the pre-built virtualenv from the builder stage.
@@ -56,9 +61,12 @@ COPY --from=builder "$VENV" "$VENV"
 ENV PATH="$VENV/bin:$PATH"
 
 # Python runtime hygiene: no .pyc writes, unbuffered stdout/stderr so logs
-# stream straight to the platform's log collector.
+# stream straight to the platform's log collector. TZ makes datetime.now()
+# and the APScheduler cron triggers use IST — override with -e TZ=... at run
+# time to deploy in another zone.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    TZ=Asia/Kolkata \
     PORT=8080 \
     WEB_CONCURRENCY=2
 

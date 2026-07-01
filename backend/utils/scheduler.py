@@ -1,3 +1,4 @@
+import os
 from datetime import datetime, timedelta, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -7,9 +8,26 @@ from apscheduler.triggers.interval import IntervalTrigger
 from database import db
 from utils.attendance_rules import is_weekend
 
+
+def _scheduler_timezone():
+    """Timezone the cron jobs fire in. Defaults to Asia/Kolkata so the
+    10:00 check-in / 18:00 check-out nudges land at the right IST wall-clock
+    time even inside a Docker container (which otherwise runs in UTC).
+    Overridable via SCHEDULER_TZ / TZ. Falls back to the machine's local
+    time if tzdata isn't available."""
+    name = os.getenv("SCHEDULER_TZ") or os.getenv("TZ") or "Asia/Kolkata"
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo(name)
+    except Exception:
+        return None
+
+
 # In-process scheduler. Single uvicorn worker assumed for demo.
 # For multi-worker prod, move jobs to an external scheduler.
-scheduler = AsyncIOScheduler()
+_TZ = _scheduler_timezone()
+scheduler = AsyncIOScheduler(timezone=_TZ) if _TZ else AsyncIOScheduler()
 
 
 # ================= AUTO-CLOSE ATTENDANCE =================
@@ -329,9 +347,100 @@ async def daily_absent_marker() -> None:
     )
 
 
+# ================= MORNING CHECK-IN REMINDER =================
+async def morning_checkin_reminder() -> None:
+    """At 10:00 (scheduler tz), nudge every Active user who hasn't started
+    their day yet to check in.
+
+    Skips weekends and public holidays, users who already have any
+    attendance row for today (checked in, WFH, on-leave, etc.), and users on
+    approved leave covering today — so nobody who's already accounted for
+    gets pinged.
+    """
+    from utils.push import push_to_users
+
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    if is_weekend(today):
+        print(
+            f"[scheduler] morning_checkin_reminder: {today} is a weekend "
+            "— skipping"
+        )
+        return
+
+    if await db.holidays.find_one({"date": today}):
+        print(
+            f"[scheduler] morning_checkin_reminder: {today} is a holiday "
+            "— skipping"
+        )
+        return
+
+    active_user_ids: list[str] = []
+    async for u in db.users.find(
+        {
+            "$or": [
+                {"status": "Active"},
+                {"status": {"$exists": False}},
+            ]
+        },
+        {"_id": 1},
+    ):
+        active_user_ids.append(str(u["_id"]))
+
+    if not active_user_ids:
+        return
+
+    # Users who already have an attendance row for today — skip them.
+    has_attendance: set[str] = set()
+    async for r in db.attendance.find(
+        {"date": today, "userId": {"$in": active_user_ids}},
+        {"userId": 1},
+    ):
+        if r.get("userId"):
+            has_attendance.add(r["userId"])
+
+    # Users on approved leave covering today — skip them too.
+    on_leave: set[str] = set()
+    async for lr in db.leave_requests.find(
+        {
+            "status": "APPROVED",
+            "userId": {"$in": active_user_ids},
+            "fromDate": {"$lte": today},
+            "toDate": {"$gte": today},
+        },
+        {"userId": 1},
+    ):
+        if lr.get("userId"):
+            on_leave.add(lr["userId"])
+
+    targets = [
+        uid
+        for uid in active_user_ids
+        if uid not in has_attendance and uid not in on_leave
+    ]
+
+    if not targets:
+        print("[scheduler] morning_checkin_reminder: nobody to nudge")
+        return
+
+    try:
+        await push_to_users(
+            targets,
+            "Don't forget to check in",
+            "Good morning! Tap to check in and start your day.",
+            {"type": "checkin_reminder"},
+        )
+    except Exception as e:
+        print(f"[scheduler] morning_checkin_reminder push failed: {e}")
+
+    print(
+        f"[scheduler] morning_checkin_reminder: nudged {len(targets)} user(s)"
+    )
+
+
 # ================= EVENING CHECKOUT REMINDER =================
 async def evening_checkout_reminder() -> None:
-    """At 23:00 server local time, push every user still CHECKED_IN."""
+    """At 18:00 (scheduler tz), push every user still CHECKED_IN today."""
     from utils.push import push_to_users
 
     today = datetime.now().strftime("%Y-%m-%d")
@@ -581,9 +690,18 @@ def start_scheduler() -> None:
         replace_existing=True,
     )
 
+    # 10:00 — nudge anyone who hasn't checked in yet to start their day.
+    scheduler.add_job(
+        morning_checkin_reminder,
+        CronTrigger(hour=10, minute=0),
+        id="morning_checkin_reminder",
+        replace_existing=True,
+    )
+
+    # 18:00 — nudge anyone still checked in to check out for the day.
     scheduler.add_job(
         evening_checkout_reminder,
-        CronTrigger(hour=23, minute=0),
+        CronTrigger(hour=18, minute=0),
         id="evening_checkout_reminder",
         replace_existing=True,
     )
