@@ -3,14 +3,12 @@ import time
 from collections import defaultdict
 
 from fastapi import FastAPI, Request
-from fastapi.staticfiles import StaticFiles
-from pathlib import Path
 
 from fastapi.middleware.cors import (
     CORSMiddleware
 )
 
-from config import UPLOAD_DIR
+from utils import storage
 
 from routes.auth import (
     router as auth_router
@@ -122,6 +120,8 @@ from routes.performance import (
 
 from routes.uploads import router as uploads_router
 
+from routes.files import router as files_router
+
 from routes.user import router as user_router
 
 from routes.public import (
@@ -178,6 +178,9 @@ app = FastAPI()
 @app.on_event("startup")
 async def on_startup():
     await create_indexes()
+    # Create the object-storage bucket up front (no-op unless S3 is enabled)
+    # so the first upload doesn't pay for a head/create round-trip.
+    storage.ensure_bucket()
     start_scheduler()
 
 
@@ -750,12 +753,11 @@ app.include_router(
     tags=["User"],
 )
 
-# Serve uploaded files at /static/uploads/<rel-path>
-Path(UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
-app.mount(
-    "/static/uploads",
-    StaticFiles(directory=UPLOAD_DIR),
-    name="uploads",
+# Serve uploaded files at /static/uploads/<key>. Backend-agnostic: streams
+# from S3/MinIO in production, reads from UPLOAD_DIR in local mode.
+app.include_router(
+    files_router,
+    tags=["Files"],
 )
 
 # ================= PUBLIC (NO-AUTH) =================

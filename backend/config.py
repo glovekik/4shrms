@@ -102,7 +102,8 @@ WEEKEND_DAYS = [
 
 # ================= UPLOADS =================
 # Local file storage. For real production, swap to S3/Cloudflare R2 — the
-# /uploads endpoint stays the same; only the implementation changes.
+# /uploads endpoint stays the same; only the implementation changes (see
+# OBJECT STORAGE below + utils/storage.py).
 UPLOAD_DIR = os.getenv(
     "UPLOAD_DIR",
     str(Path(__file__).resolve().parent / "uploads"),
@@ -113,6 +114,33 @@ MAX_UPLOAD_BYTES = int(
 # Public base URL used when constructing returned file URLs.
 # Set to your backend's public origin in prod (e.g. https://api.example.com).
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
+
+
+# ================= OBJECT STORAGE (S3 / MinIO) =================
+# Two backends, chosen by STORAGE_BACKEND:
+#   "local" (default) — filesystem under UPLOAD_DIR. Zero-config for dev.
+#   "s3"              — any S3-compatible store (MinIO, AWS S3, R2). Used
+#                       in production; files live in S3_BUCKET and are
+#                       streamed back through /static/uploads/<key> so the
+#                       public URL contract is identical to local mode.
+# Values are stripped because keys/endpoints copy-pasted from a secrets
+# manager often carry stray whitespace that silently breaks auth.
+STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "local").strip().lower()
+S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL", "").strip()
+S3_ACCESS_KEY_ID = os.getenv("S3_ACCESS_KEY_ID", "").strip()
+S3_SECRET_ACCESS_KEY = os.getenv("S3_SECRET_ACCESS_KEY", "").strip()
+S3_BUCKET = os.getenv("S3_BUCKET", "").strip()
+S3_REGION = os.getenv("S3_REGION", "us-east-1").strip()
+
+
+def is_s3_enabled() -> bool:
+    """True only when S3 is selected AND fully configured. Falling back to
+    local storage on a half-set config is safer than crashing on boot."""
+    return STORAGE_BACKEND == "s3" and bool(
+        S3_BUCKET
+        and S3_ACCESS_KEY_ID
+        and S3_SECRET_ACCESS_KEY
+    )
 
 
 # ================= PUBLIC CAREERS / OFFER ACCEPT =================
