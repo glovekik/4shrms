@@ -25,6 +25,16 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "30"))
 
 
+# ================= DATABASE (MongoDB) =================
+# Read straight from the .env loaded above so database.py uses exactly these
+# values. No localhost fallback on purpose — a missing/empty MONGO_URL should
+# fail loudly at startup (see database.py) instead of silently connecting to
+# a nonexistent local mongod, which only surfaces later as a confusing
+# "localhost:27017 connection refused".
+MONGO_URL = os.getenv("MONGO_URL", "").strip()
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "attendance_db").strip()
+
+
 # ================= COMPANY (used in payslip PDFs / emails) =================
 COMPANY_NAME = os.getenv(
     "COMPANY_NAME",

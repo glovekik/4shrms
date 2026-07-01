@@ -1,21 +1,24 @@
-import os
-
 from motor.motor_asyncio import (
     AsyncIOMotorClient
 )
 
-# Connection string + DB name are env-driven so the same code runs against
-# a local mongod for development and Atlas in production. Fall back to the
-# old hardcoded values so a fresh local checkout still works without a
-# .env file.
-MONGO_URL = os.getenv(
-    "MONGO_URL",
-    "mongodb://localhost:27017",
-)
-MONGO_DB_NAME = os.getenv(
-    "MONGO_DB_NAME",
-    "attendance_db",
-)
+# Connection string + DB name come from config.py, which loads backend/.env
+# on import — so importing them here guarantees the .env values are used
+# (not whatever os.getenv sees before dotenv runs). Same code runs against a
+# local mongod in dev and the self-hosted Mongo in production purely via .env.
+from config import MONGO_URL, MONGO_DB_NAME
+
+# Fail fast on a missing MONGO_URL rather than letting motor silently default
+# to mongodb://localhost:27017 — inside a container that "localhost" is the
+# container itself, which surfaces as a baffling "connection refused" only
+# once the first query runs. A clear error at startup points straight at the
+# real cause: MONGO_URL wasn't provided (check .env / --env-file).
+if not MONGO_URL:
+    raise RuntimeError(
+        "MONGO_URL is not set. Define it in backend/.env (loaded by "
+        "config.py) or pass it to the container (--env-file .env / -e "
+        "MONGO_URL=...). Refusing to fall back to localhost."
+    )
 
 client = AsyncIOMotorClient(
     MONGO_URL
