@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from database import db
+from utils.ist import now_ist_naive
 from utils.dependencies import require_hr, require_hr_or_ceo
 from models.expense import ExpenseCreate, ExpenseUpdate
 
@@ -121,7 +122,7 @@ async def expense_summary(
     month: Optional[int] = Query(None),
     _hr: dict = Depends(require_hr_or_ceo),
 ):
-    now = datetime.now()
+    now = now_ist_naive()
     target_year = year or now.year
     target_month = month or now.month
 

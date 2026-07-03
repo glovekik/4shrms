@@ -286,6 +286,34 @@ def _serialize_review(r: dict) -> dict:
     }
 
 
+@reviews_mgr_router.get("")
+async def manager_list_reviews(
+    status: Optional[str] = Query(None),
+    actor: dict = Depends(require_manager_or_hr),
+):
+    """Reviews a manager can see: ones they authored (managerId) or that belong
+    to their direct reports. HR sees all — same as /hr/reviews."""
+    actor_id = str(actor["_id"])
+    query: dict = {}
+    if status:
+        query["status"] = status
+    if actor.get("role") != "HR":
+        report_ids = [
+            str(u["_id"])
+            async for u in db.users.find(
+                {"reportingManagerId": actor_id}, {"_id": 1}
+            )
+        ]
+        query["$or"] = [
+            {"managerId": actor_id},
+            {"employeeId": {"$in": report_ids}},
+        ]
+    out = []
+    async for r in db.reviews.find(query).sort("createdAt", -1):
+        out.append(_serialize_review(r))
+    return out
+
+
 @reviews_mgr_router.post("")
 async def manager_create_review(
     data: ReviewCreate,

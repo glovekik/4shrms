@@ -19,6 +19,7 @@ from config import (
     is_email_configured,
 )
 from database import db
+from utils.ist import now_ist_naive
 from utils.dependencies import require_hr, require_hr_or_ceo
 from utils.email import send_notification_email
 from utils.audit import log_audit
@@ -311,7 +312,7 @@ async def create_user(
         from routes.leave import _seed_balances_for_user
         await _seed_balances_for_user(
             new_user_id,
-            datetime.now().year,
+            now_ist_naive().year,
             now,
         )
     except Exception as e:

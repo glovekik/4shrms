@@ -15,6 +15,7 @@ from typing import Optional
 
 from database import db
 from config import WEEKEND_DAYS
+from utils.ist import now_ist_naive, today_ist_str, today_ist_date
 from utils.dependencies import (
     get_current_user_doc,
     require_hr,
@@ -31,13 +32,13 @@ PRESENT_STATUSES = ["CHECKED_IN", "PRESENT", "LATE", "HALF_DAY", "COMPLETED"]
 
 
 def _today_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d")
+    return today_ist_str()
 
 
 def _upcoming_birthdays_match(days_ahead: int = 14) -> list[dict]:
     """Builds a list of (month, day) tuples for the next `days_ahead` days
     so we can match against `personal.birthday` strings (YYYY-MM-DD)."""
-    today = datetime.now().date()
+    today = today_ist_date()
     out = []
     for n in range(days_ahead + 1):
         d = today + timedelta(days=n)
@@ -248,7 +249,7 @@ async def hr_dashboard(
             )
 
     # Holiday calendar coverage — count for current year.
-    current_year = datetime.now().year
+    current_year = now_ist_naive().year
     year_prefix = f"{current_year}-"
     holiday_count_this_year = await db.holidays.count_documents({
         "date": {"$regex": f"^{year_prefix}"},
@@ -258,7 +259,7 @@ async def hr_dashboard(
     # rows to count. Skip ABSENT/holiday rows so denominator reflects
     # actual check-ins.
     thirty_days_ago = (
-        datetime.now() - timedelta(days=30)
+        now_ist_naive() - timedelta(days=30)
     ).strftime("%Y-%m-%d")
     total_recent = await db.attendance.count_documents({
         "date": {"$gte": thirty_days_ago},
@@ -368,7 +369,7 @@ async def manager_dashboard(
     })
 
     # Upcoming due-date tasks (next 7 days) for direct reports
-    end = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+    end = (now_ist_naive() + timedelta(days=7)).strftime("%Y-%m-%d")
     upcoming: list[dict] = []
     async for t in db.tasks.find({
         "assigneeId": {"$in": report_ids},
@@ -390,7 +391,7 @@ async def manager_dashboard(
     # present-equivalent days across the team (HALF_DAY = 0.5). Using working
     # days rather than "rows that exist" stops the rate from being pinned at
     # 100% when absent days simply have no attendance row.
-    month_start = datetime.now().replace(day=1).strftime("%Y-%m-%d")
+    month_start = now_ist_naive().replace(day=1).strftime("%Y-%m-%d")
     working_days = await _working_days_in_range(month_start, today)
     denom_team = len(working_days) * len(report_ids)
     present_mtd = await _present_working_days(
@@ -440,7 +441,7 @@ async def manager_dashboard(
     # On-time task delivery (last 30d) — uses the new `onTime` flag.
     # Denominator restricted to completed tasks with a dueDate set, so
     # tasks without a deadline don't skew the ratio.
-    thirty_days_ago = datetime.now() - timedelta(days=30)
+    thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
     completed_with_due = await db.tasks.count_documents({
         "assigneeId": {"$in": report_ids},
         "status": "COMPLETED",
@@ -461,7 +462,7 @@ async def manager_dashboard(
 
     # Team avg hours/day over last 7 days.
     seven_days_ago = (
-        datetime.now() - timedelta(days=7)
+        now_ist_naive() - timedelta(days=7)
     ).strftime("%Y-%m-%d")
     total_hours = 0.0
     counted_days = 0
@@ -504,7 +505,7 @@ async def my_dashboard(
 ):
     user_id = str(user["_id"])
     today = _today_str()
-    year = datetime.now().year
+    year = now_ist_naive().year
 
     # Today's attendance
     today_att = await db.attendance.find_one({
@@ -595,7 +596,7 @@ async def my_dashboard(
 
     # ===== KPIs =====
 
-    month_start = datetime.now().replace(day=1).strftime("%Y-%m-%d")
+    month_start = now_ist_naive().replace(day=1).strftime("%Y-%m-%d")
 
     # Personal attendance rate MTD. Denominator = elapsed working days this
     # month (weekdays minus holidays); numerator = present-equivalent days
@@ -633,7 +634,7 @@ async def my_dashboard(
     # first few days of a new month), so scoping to month_start would drop
     # those earlier week-days and understate the average.
     week_start = (
-        datetime.now() - timedelta(days=datetime.now().weekday())
+        now_ist_naive() - timedelta(days=now_ist_naive().weekday())
     ).strftime("%Y-%m-%d")
     total_hours_week = 0.0
     counted_days = 0
@@ -661,7 +662,7 @@ async def my_dashboard(
     # cover the SAME population — tasks created in the window — otherwise a
     # task created earlier but completed recently inflates the rate past
     # 100%. So we ask: of tasks created in the last 30d, how many are done.
-    thirty_days_ago = datetime.now() - timedelta(days=30)
+    thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
     total_my_30d = await db.tasks.count_documents({
         "assigneeId": user_id,
         "createdAt": {"$gte": thirty_days_ago},
@@ -725,7 +726,7 @@ async def upcoming_events(
 ):
     """Next holidays and employee birthdays for the sidebar widget.
     Available to every authenticated user."""
-    today = datetime.now().date()
+    today = today_ist_date()
     today_str = today.strftime("%Y-%m-%d")
 
     # Next holidays (today onward), soonest first.

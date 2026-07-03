@@ -15,6 +15,7 @@ from datetime import datetime, timezone, date, timedelta
 from typing import Optional
 
 from database import db
+from utils.ist import today_ist_str, today_ist_date
 from utils.dependencies import (
     get_current_user,
     require_hr,
@@ -229,11 +230,11 @@ async def _block_if_intern_restricted(user_id: str) -> None:
 
 
 def _today_str() -> str:
-    return date.today().strftime("%Y-%m-%d")
+    return today_ist_str()
 
 
 def _yesterday_str() -> str:
-    return (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
+    return (today_ist_date() - timedelta(days=1)).strftime("%Y-%m-%d")
 
 
 # ================= HR: SALARY STRUCTURE =================

@@ -44,17 +44,23 @@ from config import (
 
 
 def is_late(check_in_dt: datetime) -> bool:
-    """True if check-in time is later than the configured cutoff + grace."""
-    check_in_dt = _normalize(check_in_dt)
+    """True if check-in time is later than the configured cutoff + grace.
+
+    Check-in is stored as IST wall-clock (naive) — see utils/ist.py — so the
+    cutoff (LATE_AFTER_HOUR:LATE_AFTER_MINUTE, also IST) compares directly.
+    """
     if not check_in_dt:
         return False
+    # Defensive: if a tz-aware value slips in, bring it to IST wall-clock.
+    if check_in_dt.tzinfo is not None:
+        from utils.ist import IST
+        check_in_dt = check_in_dt.astimezone(IST).replace(tzinfo=None)
     cutoff_dt = check_in_dt.replace(
         hour=LATE_AFTER_HOUR,
         minute=LATE_AFTER_MINUTE,
         second=0,
         microsecond=0,
-    )
-    cutoff_dt = cutoff_dt + timedelta(minutes=GRACE_MINUTES)
+    ) + timedelta(minutes=GRACE_MINUTES)
     return check_in_dt > cutoff_dt
 
 

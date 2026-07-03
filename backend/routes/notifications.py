@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from database import db
+from utils.ist import now_ist_naive, iso_naive
 from utils.dependencies import get_current_user
 
 router = APIRouter()
@@ -86,7 +87,7 @@ async def mark_read(
     except (InvalidId, TypeError):
         raise HTTPException(400, "Invalid id")
 
-    now = datetime.now(timezone.utc)
+    now = now_ist_naive()
     result = await db.notifications.update_one(
         {"_id": oid, "userId": user_id},
         {"$set": {"read": True, "readAt": now}},
@@ -101,9 +102,40 @@ async def mark_read(
 async def mark_all_read(
     user_id: str = Depends(get_current_user),
 ):
-    now = datetime.now(timezone.utc)
+    now = now_ist_naive()
     result = await db.notifications.update_many(
         {"userId": user_id, "read": False},
         {"$set": {"read": True, "readAt": now}},
     )
     return {"updated": result.modified_count}
+
+
+# ================= DELETE ALL =================
+# Registered before the /{id} route so "clear-all" isn't captured as an id.
+@router.delete("")
+async def delete_all_notifications(
+    user_id: str = Depends(get_current_user),
+):
+    """Permanently remove every notification for the current user."""
+    result = await db.notifications.delete_many({"userId": user_id})
+    return {"deleted": result.deleted_count}
+
+
+# ================= DELETE ONE =================
+@router.delete("/{id}")
+async def delete_notification(
+    id: str,
+    user_id: str = Depends(get_current_user),
+):
+    """Permanently remove a single notification the caller owns."""
+    try:
+        oid = ObjectId(id)
+    except (InvalidId, TypeError):
+        raise HTTPException(400, "Invalid id")
+
+    result = await db.notifications.delete_one(
+        {"_id": oid, "userId": user_id}
+    )
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Notification not found")
+    return {"message": "Deleted"}

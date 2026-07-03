@@ -594,11 +594,35 @@ async def submit_interview_feedback(
 async def my_interviews(
     user_id: str = Depends(get_current_user),
 ):
-    out = []
+    raw = []
     async for i in db.interviews.find(
         {"interviewerIds": user_id},
     ).sort("scheduledAt", -1):
-        out.append(_serialize_interview(i))
+        raw.append(i)
+
+    # Resolve candidate names so the UI shows a name, not a raw ObjectId.
+    cand_oids = []
+    for i in raw:
+        cid = i.get("candidateId")
+        if cid:
+            try:
+                cand_oids.append(ObjectId(cid))
+            except (InvalidId, TypeError):
+                pass
+    cand_map: dict = {}
+    if cand_oids:
+        async for c in db.candidates.find({"_id": {"$in": cand_oids}}):
+            cand_map[str(c["_id"])] = {
+                "id": str(c["_id"]),
+                "name": c.get("name"),
+                "email": c.get("email"),
+            }
+
+    out = []
+    for i in raw:
+        s = _serialize_interview(i)
+        s["candidate"] = cand_map.get(i.get("candidateId"))
+        out.append(s)
     return out
 
 

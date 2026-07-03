@@ -29,11 +29,28 @@ async def _send_messages(messages: list[dict]) -> None:
         print(f"[push] send failed: {e}")
 
 
+def _message(token, title, body, data, channel_id, sound):
+    """Build one Expo push message. channel_id routes Android notifications to
+    a specific channel (its own sound + vibration); ignored on iOS."""
+    msg = {
+        "to": token,
+        "title": title,
+        "body": body,
+        "sound": sound,
+        "data": data or {},
+    }
+    if channel_id:
+        msg["channelId"] = channel_id
+    return msg
+
+
 async def push_to_user(
     user_id: str,
     title: str,
     body: str,
     data: Optional[dict] = None,
+    channel_id: Optional[str] = None,
+    sound: str = "default",
 ) -> None:
     """Send to all of one user's registered tokens."""
     tokens = []
@@ -45,13 +62,7 @@ async def push_to_user(
         return
 
     payload = [
-        {
-            "to": token,
-            "title": title,
-            "body": body,
-            "sound": "default",
-            "data": data or {},
-        }
+        _message(token, title, body, data, channel_id, sound)
         for token in tokens
     ]
     await _send_messages(payload)
@@ -62,6 +73,8 @@ async def push_to_users(
     title: str,
     body: str,
     data: Optional[dict] = None,
+    channel_id: Optional[str] = None,
+    sound: str = "default",
 ) -> None:
     """Bulk send to many users in one Expo call."""
     user_ids = list({uid for uid in user_ids if uid})
@@ -79,13 +92,7 @@ async def push_to_users(
         return
 
     payload = [
-        {
-            "to": token,
-            "title": title,
-            "body": body,
-            "sound": "default",
-            "data": data or {},
-        }
+        _message(token, title, body, data, channel_id, sound)
         for token in tokens
     ]
     await _send_messages(payload)

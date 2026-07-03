@@ -17,6 +17,7 @@ from typing import Optional, Literal
 
 from config import COMPANY_NAME
 from database import db
+from utils.ist import now_ist_naive
 from utils.audit import log_audit
 from utils.notify import notify_user
 
@@ -298,7 +299,7 @@ async def accept_offer_public(token: str, data: OfferResponse):
     if valid_until:
         try:
             vu = datetime.strptime(valid_until, "%Y-%m-%d")
-            if datetime.now() > vu:
+            if now_ist_naive() > vu:
                 await db.offers.update_one(
                     {"_id": offer["_id"]},
                     {"$set": {

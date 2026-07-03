@@ -7,27 +7,32 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from database import db
 from utils.attendance_rules import is_weekend
+from utils.ist import now_ist_naive
 
 
 def _scheduler_timezone():
     """Timezone the cron jobs fire in. Defaults to Asia/Kolkata so the
     10:00 check-in / 18:00 check-out nudges land at the right IST wall-clock
     time even inside a Docker container (which otherwise runs in UTC).
-    Overridable via SCHEDULER_TZ / TZ. Falls back to the machine's local
-    time if tzdata isn't available."""
+    Overridable via SCHEDULER_TZ / TZ.
+
+    CRITICAL: never return None — an unset scheduler timezone makes APScheduler
+    fall back to the container clock (UTC), which fires the 10:00 job at
+    10:00 UTC = 15:30 IST. If tzdata can't resolve the named zone, fall back to
+    a fixed IST offset (India has no DST, so a static +05:30 is exact)."""
     name = os.getenv("SCHEDULER_TZ") or os.getenv("TZ") or "Asia/Kolkata"
     try:
         from zoneinfo import ZoneInfo
 
         return ZoneInfo(name)
     except Exception:
-        return None
+        return timezone(timedelta(hours=5, minutes=30))
 
 
 # In-process scheduler. Single uvicorn worker assumed for demo.
 # For multi-worker prod, move jobs to an external scheduler.
 _TZ = _scheduler_timezone()
-scheduler = AsyncIOScheduler(timezone=_TZ) if _TZ else AsyncIOScheduler()
+scheduler = AsyncIOScheduler(timezone=_TZ)
 
 
 # ================= AUTO-CLOSE ATTENDANCE =================
@@ -37,14 +42,26 @@ async def auto_close_attendance() -> None:
     Closes any attendance still in CHECKED_IN state from a date earlier than
     today: sets checkOut to 23:59:59 of that record's date, status=COMPLETED,
     and flags `autoClosedByCron=True` so the user can request a correction.
-    """
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    Each auto-close spends one of the user's monthly auto-checkout credits
+    (default 5) and notifies the user + their reporting manager + HR.
+    """
+    from bson import ObjectId
+    from bson.errors import InvalidId
+    from utils.ist import now_ist_naive
+    from utils.notify import notify_user
+
+    today = now_ist_naive().strftime("%Y-%m-%d")
 
     cursor = db.attendance.find({
         "status": "CHECKED_IN",
         "date": {"$lt": today},
     })
+
+    # Resolve HR recipients once (few HR users).
+    hr_ids: list[str] = []
+    async for hr in db.users.find({"role": "HR"}, {"_id": 1}):
+        hr_ids.append(str(hr["_id"]))
 
     closed = 0
 
@@ -57,11 +74,11 @@ async def auto_close_attendance() -> None:
         except (ValueError, TypeError, KeyError):
             continue
 
+        # 23:59:59 IST wall-clock (naive) — attendance times are stored in IST.
         check_out = record_date.replace(
             hour=23,
             minute=59,
             second=59,
-            tzinfo=timezone.utc,
         )
 
         await db.attendance.update_one(
@@ -71,14 +88,55 @@ async def auto_close_attendance() -> None:
                     "status": "COMPLETED",
                     "checkOut": check_out,
                     "autoClosedByCron": True,
-                    "updatedAt": datetime.now(
-                        timezone.utc
-                    ),
+                    "updatedAt": now_ist_naive(),
                 }
             },
         )
-
         closed += 1
+
+        # --- spend a credit + notify ---
+        uid = record.get("userId")
+        if not uid:
+            continue
+        try:
+            user = await db.users.find_one({"_id": ObjectId(uid)})
+        except (InvalidId, TypeError):
+            user = None
+        if not user:
+            continue
+
+        left = max(0, int(user.get("autoCheckoutQuota", 5)) - 1)
+        await db.users.update_one(
+            {"_id": user["_id"]}, {"$set": {"autoCheckoutQuota": left}}
+        )
+        name = user.get("name") or "A teammate"
+        d = record["date"]
+        try:
+            await notify_user(
+                uid, "auto_checkout",
+                "Auto check-out used",
+                f"You didn't check out on {d}, so we auto-closed it at 11:59 PM. "
+                f"{left} of 5 auto check-outs left this month.",
+                {"type": "auto_checkout", "date": d, "left": left},
+            )
+        except Exception:
+            pass
+
+        recipients = set(hr_ids)
+        if user.get("reportingManagerId"):
+            recipients.add(str(user["reportingManagerId"]))
+        recipients.discard(uid)
+        for rid in recipients:
+            try:
+                await notify_user(
+                    rid, "auto_checkout_report",
+                    "Team member auto checked-out",
+                    f"{name} forgot to check out on {d} — auto-closed. "
+                    f"{left}/5 credits left.",
+                    {"type": "auto_checkout_report", "userId": uid, "date": d},
+                )
+            except Exception:
+                pass
 
     print(
         f"[scheduler] auto_close_attendance: closed {closed} record(s)"
@@ -125,10 +183,13 @@ async def monthly_leave_accrual() -> None:
     behaves like the old one-month bump. From the next run onward, the
     field is stamped and real backfill kicks in.
     """
-    today = datetime.now()
+    today = now_ist_naive()
     year = today.year
     current_month = today.month
     now = datetime.now(timezone.utc)
+
+    # Refill everyone's monthly auto-checkout credits back to 5.
+    await db.users.update_many({}, {"$set": {"autoCheckoutQuota": 5}})
 
     leave_types = []
     async for t in db.leave_types.find(
@@ -260,7 +321,7 @@ async def daily_absent_marker() -> None:
     NOT auto-inserted — they're derivable at read time.
     """
     yesterday = (
-        datetime.now() - timedelta(days=1)
+        now_ist_naive() - timedelta(days=1)
     ).strftime("%Y-%m-%d")
 
     if is_weekend(yesterday):
@@ -349,17 +410,18 @@ async def daily_absent_marker() -> None:
 
 # ================= MORNING CHECK-IN REMINDER =================
 async def morning_checkin_reminder() -> None:
-    """At 10:00 (scheduler tz), nudge every Active user who hasn't started
-    their day yet to check in.
+    """Runs hourly on the hour from 10:00–17:00 (scheduler tz): nudge every
+    Active user who still hasn't started their day to check in, once per hour
+    until they do.
 
     Skips weekends and public holidays, users who already have any
     attendance row for today (checked in, WFH, on-leave, etc.), and users on
-    approved leave covering today — so nobody who's already accounted for
-    gets pinged.
+    approved leave covering today — so nobody who's already accounted for, or
+    who applied leave, gets pinged.
     """
     from utils.push import push_to_users
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = now_ist_naive().strftime("%Y-%m-%d")
 
     if is_weekend(today):
         print(
@@ -426,9 +488,10 @@ async def morning_checkin_reminder() -> None:
     try:
         await push_to_users(
             targets,
-            "Don't forget to check in",
-            "Good morning! Tap to check in and start your day.",
+            "You haven't checked in yet",
+            "You're not checked in and have no leave for today — tap to check in.",
             {"type": "checkin_reminder"},
+            channel_id="checkin",
         )
     except Exception as e:
         print(f"[scheduler] morning_checkin_reminder push failed: {e}")
@@ -440,10 +503,11 @@ async def morning_checkin_reminder() -> None:
 
 # ================= EVENING CHECKOUT REMINDER =================
 async def evening_checkout_reminder() -> None:
-    """At 18:00 (scheduler tz), push every user still CHECKED_IN today."""
+    """Runs hourly on the hour from 18:00–22:00 (scheduler tz): push every
+    user still CHECKED_IN today, once per hour until they check out."""
     from utils.push import push_to_users
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = now_ist_naive().strftime("%Y-%m-%d")
 
     user_ids: list[str] = []
     async for r in db.attendance.find({
@@ -462,9 +526,10 @@ async def evening_checkout_reminder() -> None:
     try:
         await push_to_users(
             user_ids,
-            "Don't forget to check out",
-            "You're still checked in — tap to wrap up your day.",
+            "You haven't checked out yet",
+            "You're still checked in — tap to check out and wrap up your day.",
             {"type": "checkout_reminder"},
+            channel_id="checkout",
         )
     except Exception as e:
         print(f"[scheduler] evening_checkout_reminder push failed: {e}")
@@ -473,6 +538,52 @@ async def evening_checkout_reminder() -> None:
         f"[scheduler] evening_checkout_reminder: nudged "
         f"{len(user_ids)} user(s)"
     )
+
+
+# ================= 8-HOUR CHECK-OUT REMINDER =================
+async def checkout_reminder_8h() -> None:
+    """Every 30 min: nudge anyone still CHECKED_IN 8+ hours after check-in to
+    check out. Fires once per record (checkoutReminderSent). Skips leave days.
+    """
+    from utils.push import push_to_users
+    from utils.ist import now_ist_naive
+
+    today = now_ist_naive().strftime("%Y-%m-%d")
+    threshold = now_ist_naive() - timedelta(hours=8)
+
+    user_ids: list[str] = []
+    ids_to_flag: list = []
+    async for r in db.attendance.find({
+        "status": "CHECKED_IN",
+        "date": today,
+        "attendanceType": {"$ne": "LEAVE"},
+        "checkoutReminderSent": {"$ne": True},
+        "checkIn": {"$lte": threshold},
+    }):
+        if r.get("userId"):
+            user_ids.append(r["userId"])
+            ids_to_flag.append(r["_id"])
+
+    if not user_ids:
+        return
+
+    for _id in ids_to_flag:
+        await db.attendance.update_one(
+            {"_id": _id}, {"$set": {"checkoutReminderSent": True}}
+        )
+
+    try:
+        await push_to_users(
+            user_ids,
+            "Time to check out",
+            "You've been checked in for 8+ hours — don't forget to check out.",
+            {"type": "checkout_8h"},
+            channel_id="checkout",
+        )
+    except Exception as e:
+        print(f"[scheduler] checkout_reminder_8h push failed: {e}")
+
+    print(f"[scheduler] checkout_reminder_8h: nudged {len(user_ids)} user(s)")
 
 
 # ================= DAILY HR ATTENDANCE BRIEF =================
@@ -486,7 +597,7 @@ async def hr_daily_attendance_brief() -> None:
     from utils.push import push_to_users
     from utils.notify import create_notification
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = now_ist_naive().strftime("%Y-%m-%d")
 
     # Active employee pool — terminated users are excluded from counts.
     active_user_ids: list[str] = []
@@ -722,46 +833,48 @@ def start_scheduler() -> None:
 
     scheduler.add_job(
         auto_close_attendance,
-        CronTrigger(hour=0, minute=1),
+        CronTrigger(hour=0, minute=1, timezone=_TZ),
         id="auto_close_attendance",
         replace_existing=True,
     )
 
     scheduler.add_job(
         monthly_leave_accrual,
-        CronTrigger(day=1, hour=0, minute=5),
+        CronTrigger(day=1, hour=0, minute=5, timezone=_TZ),
         id="monthly_leave_accrual",
         replace_existing=True,
     )
 
-    # 10:00 — nudge anyone who hasn't checked in yet to start their day.
+    # Hourly 10:00–17:00 IST — repeatedly nudge anyone who hasn't checked in
+    # yet (and hasn't applied leave) until they start their day.
     scheduler.add_job(
         morning_checkin_reminder,
-        CronTrigger(hour=10, minute=0),
+        CronTrigger(hour="10-17", minute=0, timezone=_TZ),
         id="morning_checkin_reminder",
         replace_existing=True,
     )
 
-    # 18:00 — nudge anyone still checked in to check out for the day.
+    # Hourly 18:00–22:00 IST — repeatedly nudge anyone still checked in to
+    # check out until they wrap up their day.
     scheduler.add_job(
         evening_checkout_reminder,
-        CronTrigger(hour=18, minute=0),
+        CronTrigger(hour="18-22", minute=0, timezone=_TZ),
         id="evening_checkout_reminder",
         replace_existing=True,
     )
 
     scheduler.add_job(
         daily_absent_marker,
-        CronTrigger(hour=0, minute=30),
+        CronTrigger(hour=0, minute=30, timezone=_TZ),
         id="daily_absent_marker",
         replace_existing=True,
     )
 
-    # Mon-Sat at 11:00 server tz. Pushes the daily attendance brief to
+    # Mon-Sat at 11:00 IST. Pushes the daily attendance brief to
     # every HR user. Skipped automatically on Sundays via day_of_week.
     scheduler.add_job(
         hr_daily_attendance_brief,
-        CronTrigger(day_of_week="mon-sat", hour=11, minute=0),
+        CronTrigger(day_of_week="mon-sat", hour=11, minute=0, timezone=_TZ),
         id="hr_daily_attendance_brief",
         replace_existing=True,
     )
@@ -772,6 +885,14 @@ def start_scheduler() -> None:
         todo_reminder_dispatch,
         IntervalTrigger(minutes=1),
         id="todo_reminder_dispatch",
+        replace_existing=True,
+    )
+
+    # Every 30 min: remind anyone checked in 8+ hours to check out.
+    scheduler.add_job(
+        checkout_reminder_8h,
+        IntervalTrigger(minutes=30),
+        id="checkout_reminder_8h",
         replace_existing=True,
     )
 

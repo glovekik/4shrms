@@ -15,6 +15,7 @@ from typing import Optional
 from uuid import uuid4
 
 from database import db
+from utils.ist import today_ist_date
 from utils.notify import notify_user, notify_approvers
 from utils.dependencies import (
     get_current_user,
@@ -231,7 +232,7 @@ async def submit_resignation(
             "Invalid requestedLastWorkingDay (YYYY-MM-DD)",
         )
 
-    if last_day < date.today():
+    if last_day < today_ist_date():
         raise HTTPException(
             400,
             "requestedLastWorkingDay cannot be in the past",

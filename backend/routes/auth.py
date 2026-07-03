@@ -517,6 +517,9 @@ async def get_me(
         "tag":
         user.get("tag", "Employee"),
 
+        "autoCheckoutQuota":
+        user.get("autoCheckoutQuota", 5),
+
         "employeeCode":
         user.get("employeeCode"),
 

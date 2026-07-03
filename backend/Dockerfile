@@ -22,7 +22,14 @@ FROM python:3.12-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         curl \
+        tzdata \
     && rm -rf /var/lib/apt/lists/*
+
+# Safety net for time handling. Business dates are computed explicitly via
+# utils.ist (fixed +05:30 offset, so correct regardless of this), but pinning
+# the container clock to IST means any stray naive datetime.now() also reads
+# IST instead of UTC. Audit timestamps still use datetime.now(timezone.utc).
+ENV TZ=Asia/Kolkata
 
 ENV VENV=/opt/venv
 COPY --from=builder "$VENV" "$VENV"

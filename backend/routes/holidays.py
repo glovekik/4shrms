@@ -145,6 +145,17 @@ async def update_holiday(
     update: dict = {
         "updatedAt": datetime.now(timezone.utc),
     }
+    if data.date is not None:
+        _validate_date(data.date)
+        # Another holiday already on that date? Block the clash.
+        clash = await db.holidays.find_one(
+            {"date": data.date, "_id": {"$ne": oid}}
+        )
+        if clash:
+            raise HTTPException(
+                400, f"Another holiday already exists on {data.date}"
+            )
+        update["date"] = data.date
     if data.name is not None:
         update["name"] = data.name
     if data.description is not None:

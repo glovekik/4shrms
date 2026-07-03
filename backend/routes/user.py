@@ -137,6 +137,7 @@ def _serialize_profile(user: dict) -> dict:
         "workPhone": user.get("workPhone"),
         "joiningDate": user.get("joiningDate"),
         "status": user.get("status"),
+        "autoCheckoutQuota": user.get("autoCheckoutQuota", 5),
         "profilePictureUrl": user.get("profilePictureUrl"),
         "personal": user.get("personal") or {},
         "emergencyContact": user.get("emergencyContact") or {},

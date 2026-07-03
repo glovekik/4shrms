@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from database import db
+from utils.ist import now_ist_naive, iso_naive
 
 
 # Audit rows auto-expire after 2 days via a TTL index on `expiresAt`
@@ -38,7 +39,7 @@ async def log_audit(
                   caller is responsible for converting). Optional.
     """
     try:
-        now = datetime.now(timezone.utc)
+        now = now_ist_naive()
         doc = {
             "actorId": actor_id,
             "action": action,

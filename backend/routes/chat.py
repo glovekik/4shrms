@@ -3,16 +3,18 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from bson import ObjectId
 from bson.errors import InvalidId
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from typing import Optional
 
 from database import db
 from utils.dependencies import get_current_user_doc
+from utils.ist import now_ist_naive, iso_naive, IST
 from utils.notify import notify_user
 from utils.push import push_to_users
 from utils.realtime import publish as realtime_publish
-from models.message import MessageCreate
+from models.message import MessageCreate, MessageEdit
+from config import CHAT_EDIT_WINDOW_MINUTES, CHAT_DELETE_WINDOW_MINUTES
 
 # Two routers, one helper set. Office and team chat are structurally identical
 # — `channelType` + `channelId` discriminate which channel a message belongs to.
@@ -24,17 +26,27 @@ team_router = APIRouter()
 def _serialize_message(
     m: dict,
     user_info: Optional[dict] = None,
+    read_by_others: bool = False,
 ) -> dict:
+    deleted = bool(m.get("deleted"))
+    created = m.get("createdAt")
     return {
         "id": str(m["_id"]),
         "userId": m.get("userId"),
         "user": user_info,
-        "text": m.get("text", ""),
-        "mentions": m.get("mentions", []),
-        "createdAt": (
-            m["createdAt"].isoformat()
-            if m.get("createdAt") else None
+        # A message deleted-for-everyone keeps its slot but drops its content.
+        "text": "" if deleted else m.get("text", ""),
+        "mentions": [] if deleted else m.get("mentions", []),
+        "attachments": [] if deleted else m.get("attachments", []),
+        "createdAt": iso_naive(created),
+        "editedAt": (
+            iso_naive(m["editedAt"])
+            if m.get("editedAt") and not deleted else None
         ),
+        "deleted": deleted,
+        # Whether anyone other than the author has read it — drives read
+        # receipts and whether edit/delete-for-everyone is still allowed.
+        "readByOthers": read_by_others,
     }
 
 
@@ -87,43 +99,78 @@ def _parse_before(
         )
 
 
+async def _channel_reads(
+    channel_type: str, channel_id: Optional[str]
+) -> dict:
+    """{userId: lastReadAt} for everyone who has opened this channel."""
+    reads: dict = {}
+    async for r in db.chat_reads.find(
+        {"channelType": channel_type, "channelId": channel_id}
+    ):
+        if r.get("userId") and r.get("lastReadAt"):
+            reads[r["userId"]] = r["lastReadAt"]
+    return reads
+
+
+def _read_by_others(msg: dict, reads: dict) -> bool:
+    """True if any user other than the author has read past this message."""
+    created = msg.get("createdAt")
+    if not created:
+        return False
+    author = msg.get("userId")
+    for uid, last in reads.items():
+        if uid != author and last and last >= created:
+            return True
+    return False
+
+
 async def _list_messages(
     channel_type: str,
     channel_id: Optional[str],
     before: Optional[str],
     limit: int,
+    user: dict,
 ) -> list[dict]:
+    user_id = str(user["_id"])
     query: dict = {
         "channelType": channel_type,
         "channelId": channel_id,
+        # Hide messages this user deleted just for themselves.
+        "deletedFor": {"$ne": user_id},
     }
 
+    # createdAt bounds: pagination cursor (< before) AND join-date floor
+    # (>= account creation) so a new member never sees pre-join history.
+    created_filter: dict = {}
     before_dt = _parse_before(before)
     if before_dt:
-        query["createdAt"] = {"$lt": before_dt}
+        created_filter["$lt"] = before_dt
+    floor = user.get("createdAt")
+    if floor:
+        created_filter["$gte"] = floor
+    if created_filter:
+        query["createdAt"] = created_filter
 
     raw: list[dict] = []
-
     cursor = (
         db.chat_messages.find(query)
         .sort("createdAt", -1)
         .limit(limit)
     )
-
     async for m in cursor:
         raw.append(m)
 
     # Oldest-first within the page so the UI just appends.
     raw.reverse()
 
-    user_map = await _get_user_basics(
-        m.get("userId") for m in raw
-    )
+    user_map = await _get_user_basics(m.get("userId") for m in raw)
+    reads = await _channel_reads(channel_type, channel_id)
 
     return [
         _serialize_message(
             m,
             user_map.get(m.get("userId")),
+            _read_by_others(m, reads),
         )
         for m in raw
     ]
@@ -159,17 +206,23 @@ async def _insert_message(
     text: str,
     mentions: Optional[list[str]],
     user: dict,
+    attachments: Optional[list] = None,
 ) -> dict:
-    text = text.strip()
+    text = (text or "").strip()
+    # Serialize Pydantic attachment models to plain dicts.
+    atts = [
+        a.model_dump() if hasattr(a, "model_dump") else dict(a)
+        for a in (attachments or [])
+    ]
 
-    if not text:
+    if not text and not atts:
         raise HTTPException(
             400,
-            "Message text required",
+            "Message text or attachment required",
         )
 
     user_id = str(user["_id"])
-    now = datetime.now(timezone.utc)
+    now = now_ist_naive()
 
     resolved_mentions = await _validate_mentions(mentions)
     # Don't notify the author for self-mentions.
@@ -181,6 +234,7 @@ async def _insert_message(
         "userId": user_id,
         "text": text,
         "mentions": resolved_mentions,
+        "attachments": atts,
         "createdAt": now,
     }
 
@@ -194,7 +248,20 @@ async def _insert_message(
     }
 
     author_name = user.get("name") or "Someone"
-    snippet = text if len(text) <= 140 else text[:137] + "..."
+    if text:
+        snippet = text if len(text) <= 140 else text[:137] + "..."
+    elif atts:
+        kinds = {a.get("type") for a in atts}
+        if "image" in kinds:
+            snippet = "📷 Photo"
+        elif "voice" in kinds:
+            snippet = "🎤 Voice message"
+        elif "sticker" in kinds:
+            snippet = "Sticker"
+        else:
+            snippet = "📎 Attachment"
+    else:
+        snippet = ""
 
     if resolved_mentions:
         for mentioned_id in resolved_mentions:
@@ -296,34 +363,119 @@ async def _insert_message(
     return _serialize_message(msg, user_info)
 
 
-async def _delete_message(
-    channel_type: str,
-    channel_id: Optional[str],
-    message_id: str,
-    user: dict,
+async def _load_own_message(
+    channel_type, channel_id, message_id, user, action: str
 ) -> dict:
     try:
         oid = ObjectId(message_id)
     except (InvalidId, TypeError):
         raise HTTPException(400, "Invalid message id")
-
     msg = await db.chat_messages.find_one({
         "_id": oid,
         "channelType": channel_type,
         "channelId": channel_id,
     })
+    if not msg:
+        raise HTTPException(404, "Message not found")
+    if msg.get("userId") != str(user["_id"]):
+        raise HTTPException(403, f"You can only {action} your own messages")
+    return msg
 
+
+def _within(created, minutes: int) -> bool:
+    if not created:
+        return False
+    # createdAt is IST wall-clock (naive); compare against IST now.
+    if created.tzinfo is not None:
+        created = created.astimezone(IST).replace(tzinfo=None)
+    return now_ist_naive() - created <= timedelta(minutes=minutes)
+
+
+async def _mark_read(channel_type, channel_id, user) -> dict:
+    """Stamp this user's read pointer for the channel to now."""
+    await db.chat_reads.update_one(
+        {
+            "channelType": channel_type,
+            "channelId": channel_id,
+            "userId": str(user["_id"]),
+        },
+        {"$set": {"lastReadAt": now_ist_naive()}},
+        upsert=True,
+    )
+    return {"message": "ok"}
+
+
+async def _edit_message(
+    channel_type, channel_id, message_id, text, mentions, user,
+) -> dict:
+    msg = await _load_own_message(channel_type, channel_id, message_id, user, "edit")
+    if msg.get("deleted"):
+        raise HTTPException(400, "This message was deleted")
+
+    # "Both" rule: within the edit window AND not yet read by anyone else.
+    if not _within(msg.get("createdAt"), CHAT_EDIT_WINDOW_MINUTES):
+        raise HTTPException(403, "Edit window has passed")
+    reads = await _channel_reads(channel_type, channel_id)
+    if _read_by_others(msg, reads):
+        raise HTTPException(403, "Can't edit — already read by someone")
+
+    text = (text or "").strip()
+    if not text:
+        raise HTTPException(400, "Message text required")
+
+    resolved = await _validate_mentions(mentions)
+    resolved = [m for m in resolved if m != str(user["_id"])]
+    now = now_ist_naive()
+    await db.chat_messages.update_one(
+        {"_id": msg["_id"]},
+        {"$set": {"text": text, "mentions": resolved, "editedAt": now}},
+    )
+    msg.update({"text": text, "mentions": resolved, "editedAt": now})
+    user_info = {"id": str(user["_id"]), "name": user.get("name"), "email": user.get("email")}
+    return _serialize_message(msg, user_info, _read_by_others(msg, reads))
+
+
+async def _delete_message(
+    channel_type: str,
+    channel_id: Optional[str],
+    message_id: str,
+    user: dict,
+    scope: str = "everyone",
+) -> dict:
+    user_id = str(user["_id"])
+    try:
+        oid = ObjectId(message_id)
+    except (InvalidId, TypeError):
+        raise HTTPException(400, "Invalid message id")
+    msg = await db.chat_messages.find_one({
+        "_id": oid,
+        "channelType": channel_type,
+        "channelId": channel_id,
+    })
     if not msg:
         raise HTTPException(404, "Message not found")
 
-    if msg.get("userId") != str(user["_id"]):
-        raise HTTPException(
-            403,
-            "You can only delete your own messages",
+    # Delete for me: hide it only from this user. Always allowed.
+    if scope == "me":
+        await db.chat_messages.update_one(
+            {"_id": oid}, {"$addToSet": {"deletedFor": user_id}}
         )
+        return {"message": "Message deleted for you"}
 
-    await db.chat_messages.delete_one({"_id": oid})
+    # Delete for everyone: author only, within window AND not read by others.
+    if msg.get("userId") != user_id:
+        raise HTTPException(403, "You can only delete your own messages")
+    if not _within(msg.get("createdAt"), CHAT_DELETE_WINDOW_MINUTES):
+        raise HTTPException(403, "Delete window has passed")
+    reads = await _channel_reads(channel_type, channel_id)
+    if _read_by_others(msg, reads):
+        raise HTTPException(403, "Can't delete for everyone — already read by someone")
 
+    await db.chat_messages.update_one(
+        {"_id": oid},
+        {"$set": {"deleted": True, "text": "", "mentions": [],
+                  "deletedAt": now_ist_naive()}},
+    )
     return {"message": "Message deleted"}
 
 
@@ -367,7 +519,7 @@ async def list_office_messages(
     user: dict = Depends(get_current_user_doc),
 ):
     return await _list_messages(
-        "office", None, before, limit,
+        "office", None, before, limit, user,
     )
 
 
@@ -377,17 +529,36 @@ async def post_office_message(
     user: dict = Depends(get_current_user_doc),
 ):
     return await _insert_message(
-        "office", None, data.text, data.mentions, user,
+        "office", None, data.text, data.mentions, user, data.attachments,
+    )
+
+
+@office_router.post("/messages/read")
+async def read_office_messages(
+    user: dict = Depends(get_current_user_doc),
+):
+    return await _mark_read("office", None, user)
+
+
+@office_router.put("/messages/{messageId}")
+async def edit_office_message(
+    messageId: str,
+    data: MessageEdit,
+    user: dict = Depends(get_current_user_doc),
+):
+    return await _edit_message(
+        "office", None, messageId, data.text, data.mentions, user,
     )
 
 
 @office_router.delete("/messages/{messageId}")
 async def delete_office_message(
     messageId: str,
+    scope: str = Query("everyone"),
     user: dict = Depends(get_current_user_doc),
 ):
     return await _delete_message(
-        "office", None, messageId, user,
+        "office", None, messageId, user, scope,
     )
 
 
@@ -401,7 +572,7 @@ async def list_team_messages(
 ):
     await _ensure_team_chat_access(teamId, user)
     return await _list_messages(
-        "team", teamId, before, limit,
+        "team", teamId, before, limit, user,
     )
 
 
@@ -413,7 +584,29 @@ async def post_team_message(
 ):
     await _ensure_team_chat_access(teamId, user)
     return await _insert_message(
-        "team", teamId, data.text, data.mentions, user,
+        "team", teamId, data.text, data.mentions, user, data.attachments,
+    )
+
+
+@team_router.post("/{teamId}/messages/read")
+async def read_team_messages(
+    teamId: str,
+    user: dict = Depends(get_current_user_doc),
+):
+    await _ensure_team_chat_access(teamId, user)
+    return await _mark_read("team", teamId, user)
+
+
+@team_router.put("/{teamId}/messages/{messageId}")
+async def edit_team_message(
+    teamId: str,
+    messageId: str,
+    data: MessageEdit,
+    user: dict = Depends(get_current_user_doc),
+):
+    await _ensure_team_chat_access(teamId, user)
+    return await _edit_message(
+        "team", teamId, messageId, data.text, data.mentions, user,
     )
 
 
@@ -421,9 +614,10 @@ async def post_team_message(
 async def delete_team_message(
     teamId: str,
     messageId: str,
+    scope: str = Query("everyone"),
     user: dict = Depends(get_current_user_doc),
 ):
     await _ensure_team_chat_access(teamId, user)
     return await _delete_message(
-        "team", teamId, messageId, user,
+        "team", teamId, messageId, user, scope,
     )

@@ -4,9 +4,10 @@ Self-contained — feed in payslip + user dicts, get bytes back.
 """
 
 import os
-from datetime import datetime
 from io import BytesIO
 from calendar import month_name
+
+from utils.ist import now_ist_naive
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -401,7 +402,7 @@ def build_experience_letter_pdf(
         )
     elements.append(Spacer(1, 8 * mm))
 
-    today_str = datetime.now().strftime("%B %d, %Y")
+    today_str = now_ist_naive().strftime("%B %d, %Y")
     elements.append(
         Paragraph(f"Date: {today_str}", base["Normal"])
     )

@@ -55,6 +55,7 @@ def _serialize(r: dict, user_info: Optional[dict] = None) -> dict:
             if isinstance(r.get("checkOut"), datetime)
             else r.get("checkOut")
         ),
+        "attendanceType": r.get("attendanceType", "OFFICE"),
         "reason": r.get("reason"),
         "status": r.get("status"),
         "decidedBy": r.get("decidedBy"),
@@ -158,6 +159,7 @@ async def submit_manual_request(
         "date": data.date,
         "checkIn": check_in,
         "checkOut": check_out,
+        "attendanceType": data.attendanceType or "OFFICE",
         "reason": reason,
         "status": "PENDING",
         "decisionNote": "",
@@ -368,7 +370,9 @@ async def _decide(
             attendance_doc = {
                 "userId": r["userId"],
                 "date": r["date"],
-                "attendanceType": "MANUAL",
+                # Preserve the requested type (OFFICE/WFH/…); the manual origin
+                # is still recorded via autoApprovedFromRequest + manualRequestId.
+                "attendanceType": r.get("attendanceType") or "OFFICE",
                 "status": (
                     "COMPLETED" if r.get("checkOut") else "CHECKED_IN"
                 ),

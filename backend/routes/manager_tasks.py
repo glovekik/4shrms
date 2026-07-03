@@ -18,9 +18,11 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from database import db
+from utils.ist import now_ist_naive
 from utils.dependencies import get_current_user_doc
 from utils.notify import create_notification, notify_user
 from utils.push import push_to_user
+from utils.ist import iso_naive
 from models.task import TaskCreate, TaskUpdate
 
 
@@ -350,7 +352,7 @@ async def team_attendance(
             raise HTTPException(400, "Invalid month (YYYY-MM required)")
         query["date"] = {"$regex": f"^{month}-"}
     else:
-        query["date"] = datetime.now().strftime("%Y-%m-%d")
+        query["date"] = now_ist_naive().strftime("%Y-%m-%d")
 
     records: list[dict] = []
     async for r in db.attendance.find(query).sort("date", -1):
@@ -382,10 +384,12 @@ async def team_attendance(
             "user": user_map.get(r.get("userId")),
             "date": r.get("date"),
             "attendanceType": r.get("attendanceType"),
+            "clientAddress": r.get("clientAddress"),
             "status": r.get("status"),
             "isLate": r.get("isLate", False),
             "hoursWorked": r.get("hoursWorked", 0.0),
             "overtimeHours": r.get("overtimeHours", 0.0),
+            # Stored as IST wall-clock (see utils/ist.py) — emit as-is, no Z.
             "checkIn": (
                 r["checkIn"].isoformat() if r.get("checkIn") else None
             ),
@@ -401,23 +405,32 @@ async def team_attendance(
 # ================= TEAM LEAVE BALANCES =================
 @router.get("/leave-balances")
 async def team_leave_balances(
+    userId: Optional[str] = Query(None),     # scope to one employee
     user: dict = Depends(get_current_user_doc),
 ):
-    """Per-direct-report leave balance roll-up for the current year."""
+    """Per-direct-report leave balance roll-up for the current year.
+
+    Pass `userId` to scope to a single employee (used by the employee
+    detail / work-performance view). HR may target anyone; a MANAGER may
+    only target their own direct reports.
+    """
     _require_manager(user)
     actor_id = str(user["_id"])
 
-    if user.get("role") == "MANAGER":
-        report_ids = await _direct_report_ids(actor_id)
+    if userId:
+        if user.get("role") == "MANAGER":
+            report_ids = await _direct_report_ids(actor_id)
+            if userId not in report_ids:
+                raise HTTPException(403, "Not one of your direct reports")
+        report_ids = {userId}
     else:
-        # HR can call this to see anyone's reports; if not theirs, return
-        # empty rather than 403 — this endpoint is for the manager view.
+        # No target — fall back to the caller's own direct reports.
         report_ids = await _direct_report_ids(actor_id)
 
     if not report_ids:
         return []
 
-    year = datetime.now().year
+    year = now_ist_naive().year
 
     # Resolve user info in one round-trip.
     oids = []
@@ -462,7 +475,7 @@ async def team_leave_balances(
         pending = float(b.get("pending", 0) or 0)
         remaining = allocated - used - pending
         by_user[uid].append({
-            "code": b.get("leaveTypeCode"),
+            "leaveTypeCode": b.get("leaveTypeCode"),
             "leaveType": type_map.get(b.get("leaveTypeCode")),
             "allocated": allocated,
             "used": used,
@@ -479,3 +492,83 @@ async def team_leave_balances(
     # Stable order by name so the UI list doesn't reshuffle.
     out.sort(key=lambda r: (r["user"].get("name") or "").lower())
     return out
+
+
+# ================= TEAM CLIENT-LOCATION VISITS =================
+@router.get("/client-locations")
+async def team_client_locations(
+    userId: Optional[str] = Query(None),     # scope to one employee
+    date: Optional[str] = Query(None),       # YYYY-MM-DD
+    month: Optional[str] = Query(None),      # YYYY-MM
+    user: dict = Depends(get_current_user_doc),
+):
+    """Client-location check-ins (attendanceType=CLIENT), newest first.
+
+    HR sees everyone; a MANAGER sees only their direct reports. Optional
+    `userId` / `date` / `month` filters mirror the attendance listing.
+    """
+    _require_manager(user)
+    actor_id = str(user["_id"])
+
+    query: dict = {"attendanceType": "CLIENT"}
+
+    if user.get("role") == "MANAGER":
+        report_ids = await _direct_report_ids(actor_id)
+        if not report_ids:
+            return []
+        if userId:
+            if userId not in report_ids:
+                raise HTTPException(403, "Not one of your direct reports")
+            query["userId"] = userId
+        else:
+            query["userId"] = {"$in": list(report_ids)}
+    else:
+        # HR — everyone, or one employee when userId is given.
+        if userId:
+            query["userId"] = userId
+
+    if date:
+        query["date"] = date
+    elif month:
+        if not (len(month) == 7 and month[4] == "-"):
+            raise HTTPException(400, "Invalid month (YYYY-MM required)")
+        query["date"] = {"$regex": f"^{month}-"}
+
+    records: list[dict] = []
+    async for v in db.attendance.find(query).sort("checkIn", -1):
+        records.append(v)
+
+    # Enrich with the visitor's basic info in one round-trip.
+    uids = {v.get("userId") for v in records if v.get("userId")}
+    oids = []
+    for uid in uids:
+        try:
+            oids.append(ObjectId(uid))
+        except (InvalidId, TypeError):
+            continue
+    user_map: dict[str, dict] = {}
+    if oids:
+        async for u in db.users.find({"_id": {"$in": oids}}):
+            user_map[str(u["_id"])] = {
+                "id": str(u["_id"]),
+                "name": u.get("name"),
+                "email": u.get("email"),
+                "employeeCode": u.get("employeeCode"),
+            }
+
+    return [
+        {
+            "id": str(v["_id"]),
+            "userId": v.get("userId"),
+            "user": user_map.get(v.get("userId")),
+            "date": v.get("date"),
+            "latitude": v.get("capturedLatitude"),
+            "longitude": v.get("capturedLongitude"),
+            "address": v.get("clientAddress") or "",
+            "notes": v.get("workNotes") or "",
+            "capturedAt": iso_naive(v.get("checkIn")),
+            "checkOut": iso_naive(v.get("checkOut")),
+            "hoursWorked": v.get("hoursWorked", 0.0),
+        }
+        for v in records
+    ]

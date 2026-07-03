@@ -109,6 +109,12 @@ WEEKEND_DAYS = [
     int(x) for x in os.getenv("WEEKEND_DAYS", "5,6").split(",") if x.strip()
 ]
 
+# ================= CHAT =================
+# Edit window: how long after posting a message may still be edited.
+CHAT_EDIT_WINDOW_MINUTES = int(os.getenv("CHAT_EDIT_WINDOW_MINUTES", "15"))
+# Delete-for-everyone window (delete-for-me is always allowed).
+CHAT_DELETE_WINDOW_MINUTES = int(os.getenv("CHAT_DELETE_WINDOW_MINUTES", "60"))
+
 
 # ================= UPLOADS =================
 # Local file storage. For real production, swap to S3/Cloudflare R2 — the

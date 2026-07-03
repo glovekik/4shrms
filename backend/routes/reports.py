@@ -10,10 +10,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from bson import ObjectId
 from bson.errors import InvalidId
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from database import db
+from utils.ist import now_ist_naive
 from utils.dependencies import (
     require_hr,
     require_hr_or_ceo,
@@ -125,7 +126,7 @@ async def leave_report(
     _hr: dict = Depends(require_hr_or_ceo),
 ):
     """Per-user leave balance snapshot for a year."""
-    y = year or datetime.now().year
+    y = year or now_ist_naive().year
     users = {}
     async for u in db.users.find():
         users[str(u["_id"])] = u
@@ -249,21 +250,45 @@ async def attrition_report(
 # ================= MANAGER: TEAM PRODUCTIVITY =================
 @manager_router.get("/team-productivity")
 async def team_productivity(
+    userId: Optional[str] = Query(None),      # scope to one employee
     actor: dict = Depends(require_manager_or_hr),
 ):
-    """For each direct report: open tasks, completed-last-30d, avg hours/week."""
+    """For each direct report: open tasks, completed-last-30d, avg hours/week.
+
+    Pass `userId` to scope to a single employee (used by the employee
+    detail / work-performance view). HR may target anyone; a MANAGER may
+    only target their own direct reports.
+    """
     actor_id = str(actor["_id"])
     reports = []
-    async for u in db.users.find({"reportingManagerId": actor_id}):
-        reports.append(u)
+    if userId:
+        try:
+            target_oid = ObjectId(userId)
+        except (InvalidId, TypeError):
+            raise HTTPException(400, "Invalid userId")
+        if actor.get("role") != "HR":
+            # MANAGER may only inspect their own direct reports.
+            target = await db.users.find_one({
+                "_id": target_oid,
+                "reportingManagerId": actor_id,
+            })
+            if not target:
+                raise HTTPException(403, "Not one of your direct reports")
+        else:
+            target = await db.users.find_one({"_id": target_oid})
+        if target:
+            reports.append(target)
+    else:
+        async for u in db.users.find({"reportingManagerId": actor_id}):
+            reports.append(u)
 
     if not reports:
         return []
 
-    thirty_days_ago = (datetime.now() - timedelta(days=30)).strftime(
+    thirty_days_ago = (now_ist_naive() - timedelta(days=30)).strftime(
         "%Y-%m-%d"
     )
-    seven_days_ago = (datetime.now() - timedelta(days=7)).strftime(
+    seven_days_ago = (now_ist_naive() - timedelta(days=7)).strftime(
         "%Y-%m-%d"
     )
 
@@ -278,7 +303,7 @@ async def team_productivity(
             "assigneeId": uid,
             "status": "COMPLETED",
             "completedAt": {
-                "$gte": datetime.now() - timedelta(days=30)
+                "$gte": datetime.now(timezone.utc) - timedelta(days=30)
             },
         })
 
@@ -296,7 +321,7 @@ async def team_productivity(
 
         out.append({
             "userId": uid,
-            "name": u.get("name"),
+            "userName": u.get("name"),
             "openTasks": open_tasks,
             "completedTasksLast30d": completed_30d,
             "avgHoursPerDayLast7d": avg_per_day,

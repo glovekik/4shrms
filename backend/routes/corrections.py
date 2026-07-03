@@ -10,6 +10,7 @@ from typing import Optional
 
 from config import COMPANY_NAME
 from database import db
+from utils.ist import now_ist_naive, iso_naive
 from utils.dependencies import (
     get_current_user,
     get_current_user_doc,
@@ -99,11 +100,11 @@ def _serialize(
     # `attendanceDate`, which the frontend reads top-level alongside the
     # nested `attendance` object.
     created_iso = (
-        r["createdAt"].isoformat() + "Z"
+        r["createdAt"].isoformat()
         if r.get("createdAt") else None
     )
     decided_iso = (
-        r["decidedAt"].isoformat() + "Z"
+        r["decidedAt"].isoformat()
         if r.get("decidedAt") else None
     )
     attendance_date = (
@@ -122,11 +123,11 @@ def _serialize(
         "requestedDate": r.get("requestedDate"),
         # Anchor as UTC so the client doesn't misinterpret as local time.
         "requestedCheckIn": (
-            r["requestedCheckIn"].isoformat() + "Z"
+            r["requestedCheckIn"].isoformat()
             if r.get("requestedCheckIn") else None
         ),
         "requestedCheckOut": (
-            r["requestedCheckOut"].isoformat() + "Z"
+            r["requestedCheckOut"].isoformat()
             if r.get("requestedCheckOut") else None
         ),
         "requestedAttendanceType": r.get("requestedAttendanceType"),
@@ -151,11 +152,10 @@ def _serialize(
 
 # ================= HELPERS =================
 def _parse_iso(value: str, field: str) -> datetime:
-    s = value
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
+    # Requested check-in/out are attendance times → store as IST wall-clock.
+    from utils.ist import parse_client_to_ist_naive
     try:
-        return datetime.fromisoformat(s)
+        return parse_client_to_ist_naive(value)
     except (TypeError, ValueError):
         raise HTTPException(
             400,
@@ -278,7 +278,7 @@ async def create_correction_request_for_date(
     if attendance:
         att_id = str(attendance["_id"])
     else:
-        now0 = datetime.now(timezone.utc)
+        now0 = now_ist_naive()
         placeholder = {
             "userId": user_id,
             "date": date_str,
@@ -322,7 +322,7 @@ async def create_correction_request_for_date(
             "A pending correction request already exists for this date",
         )
 
-    now = datetime.now(timezone.utc)
+    now = now_ist_naive()
     doc = {
         "userId": user_id,
         "attendanceId": att_id,
@@ -453,7 +453,7 @@ async def create_correction_request(
             "A pending correction request already exists for this record",
         )
 
-    now = datetime.now(timezone.utc)
+    now = now_ist_naive()
 
     doc = {
         "userId": user_id,
@@ -567,7 +567,7 @@ async def _decide_correction_internal(
 ) -> dict:
     """Shared approve/reject logic for HR and Manager endpoints. Caller
     must ensure the request is PENDING and the decider is authorized."""
-    now = datetime.now(timezone.utc)
+    now = now_ist_naive()
     decider_id = str(decider["_id"])
     decider_role = decider.get("role", "HR")
 

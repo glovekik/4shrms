@@ -25,9 +25,13 @@ class AttendanceCheckIn(BaseModel):
     # time matches the user's local moment regardless of server clock /
     # timezone. Falls back to server now() if missing (older clients).
     checkIn: Optional[str] = None
-    # Required when attendanceType=OFFICE; ignored otherwise.
+    # Required when attendanceType=OFFICE; for CLIENT it records the client
+    # site coordinates. Ignored for WFH.
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    # A best-effort reverse-geocoded address, stored for CLIENT check-ins so
+    # HR / managers can see where the person is working from.
+    clientAddress: Optional[str] = None
 
 
 class AttendanceCheckOut(BaseModel):

@@ -8,6 +8,7 @@ class ManualAttendanceCreate(BaseModel):
     date: str             # YYYY-MM-DD
     checkIn: str          # ISO 8601 datetime
     checkOut: Optional[str] = None
+    attendanceType: Optional[str] = "OFFICE"  # OFFICE | WFH | LEAVE | HOLIDAY
     reason: str
 
 

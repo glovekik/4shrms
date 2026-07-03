@@ -8,6 +8,7 @@ from datetime import datetime, timezone, date, timedelta
 from typing import Optional
 
 from database import db
+from utils.ist import now_ist_naive, iso_naive
 from utils.dependencies import (
     get_current_user,
     require_hr,
@@ -61,7 +62,7 @@ async def _decide_leave_internal(
     and authorizing the decider against `req["userId"]`. This function only
     handles balance updates, status change, notifications, and audit.
     """
-    now = datetime.now(timezone.utc)
+    now = now_ist_naive()
     decider_id = str(decider["_id"])
     decider_role = decider.get("role", "HR")
     actor_label = "HR" if decider_role == "HR" else "Manager"
@@ -277,8 +278,8 @@ def _serialize_balance(
 
     history = b.get("accrualHistory") or []
     year = b.get("year")
-    current_year = datetime.now().year
-    current_month = datetime.now().month
+    current_year = now_ist_naive().year
+    current_month = now_ist_naive().month
     accrued_this_month = 0.0
     accrued_ytd = 0.0
     summary: dict[int, float] = {}
@@ -456,7 +457,7 @@ async def _get_or_create_balance(
         leave_type = await db.leave_types.find_one(
             {"code": leave_type_code}
         )
-    now = datetime.now(timezone.utc)
+    now = now_ist_naive()
     doc = {
         "userId": user_id,
         "leaveTypeCode": leave_type_code,
@@ -661,8 +662,8 @@ async def list_active_leave_types(
 async def my_leave_balance(
     user_id: str = Depends(get_current_user),
 ):
-    year = datetime.now().year
-    now = datetime.now(timezone.utc)
+    year = now_ist_naive().year
+    now = now_ist_naive()
 
     types_map = await _types_by_code()
 
@@ -809,7 +810,7 @@ async def create_leave_request(
             ),
         )
 
-    now = datetime.now(timezone.utc)
+    now = now_ist_naive()
 
     request_doc = {
         "userId": user_id,
@@ -880,7 +881,7 @@ async def cancel_leave_request(
             f"Cannot cancel a {req.get('status')} request",
         )
 
-    now = datetime.now(timezone.utc)
+    now = now_ist_naive()
     year = _parse_date(req["fromDate"], "fromDate").year
 
     await db.leave_requests.update_one(
@@ -941,7 +942,7 @@ async def create_leave_type(
             f"Leave type code '{code}' already exists",
         )
 
-    now = datetime.now(timezone.utc)
+    now = now_ist_naive()
     doc = {
         "code": code,
         "name": data.name,
@@ -963,7 +964,7 @@ async def create_leave_type(
     if doc.get("isActive", True):
         try:
             await _seed_balances_for_type(
-                doc, datetime.now().year, now
+                doc, now_ist_naive().year, now
             )
         except Exception as e:
             print(f"[leave] seed-on-create failed: {e}")
@@ -998,7 +999,7 @@ async def update_leave_type(
     if not existing:
         raise HTTPException(404, "Leave type not found")
 
-    now = datetime.now(timezone.utc)
+    now = now_ist_naive()
     update: dict = {"updatedAt": now}
     for field in (
         "name",
@@ -1047,7 +1048,7 @@ async def update_leave_type(
                 await db.leave_balances.update_many(
                     {
                         "leaveTypeCode": existing.get("code"),
-                        "year": datetime.now().year,
+                        "year": now_ist_naive().year,
                     },
                     [
                         {
@@ -1061,7 +1062,7 @@ async def update_leave_type(
                     ],
                 )
             await _seed_balances_for_type(
-                merged_type, datetime.now().year, now
+                merged_type, now_ist_naive().year, now
             )
         except Exception as e:
             print(f"[leave] top-up on update failed: {e}")
@@ -1278,8 +1279,8 @@ async def hr_upsert_user_balance(
     if data.pending is not None and data.pending < 0:
         raise HTTPException(400, "pending must be >= 0")
 
-    target_year = data.year or datetime.now().year
-    now = datetime.now(timezone.utc)
+    target_year = data.year or now_ist_naive().year
+    now = now_ist_naive()
 
     set_fields: dict = {
         "allocated": data.allocated,
@@ -1355,7 +1356,7 @@ async def hr_view_user_balance(
     except (InvalidId, TypeError):
         raise HTTPException(400, "Invalid user id")
 
-    target_year = year or datetime.now().year
+    target_year = year or now_ist_naive().year
 
     types_map = await _types_by_code()
 

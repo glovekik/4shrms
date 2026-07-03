@@ -9,6 +9,7 @@ from typing import Optional
 
 from config import COMPANY_NAME
 from database import db
+from utils.ist import now_ist_naive, iso_naive
 from utils.dependencies import (
     get_current_user,
     get_current_user_doc,
@@ -113,7 +114,8 @@ async def _load_task_or_404(task_id: str) -> dict:
 
 
 async def _ensure_can_view(task: dict, user: dict) -> None:
-    """View access: assignee OR team's TL OR HR."""
+    """View access: assignee OR creator OR assignee's reporting manager
+    OR team's TL OR HR."""
     user_id = str(user["_id"])
 
     if user.get("role") == "HR":
@@ -121,6 +123,23 @@ async def _ensure_can_view(task: dict, user: dict) -> None:
 
     if task.get("assigneeId") == user_id:
         return
+
+    # Whoever created the task (e.g. a manager who assigned it) can view it.
+    if task.get("createdBy") == user_id:
+        return
+
+    # The assignee's reporting manager can view their report's task.
+    assignee_id = task.get("assigneeId")
+    if assignee_id:
+        try:
+            assignee = await db.users.find_one(
+                {"_id": ObjectId(assignee_id)},
+                {"reportingManagerId": 1},
+            )
+        except (InvalidId, TypeError):
+            assignee = None
+        if assignee and str(assignee.get("reportingManagerId")) == user_id:
+            return
 
     try:
         team_oid = ObjectId(task["teamId"])
@@ -239,7 +258,7 @@ async def start_task(
     if task.get("status") == "ONGOING":
         return {"message": "Task already in progress"}
 
-    now = datetime.now(timezone.utc)
+    now = now_ist_naive()
     await db.tasks.update_one(
         {"_id": task["_id"]},
         {
@@ -272,10 +291,11 @@ async def complete_task(
             "Task already completed",
         )
 
-    now = datetime.now(timezone.utc)
+    now = now_ist_naive()
 
-    # Server local date — matches /attendance/today's fallback.
-    today = datetime.now().strftime("%Y-%m-%d")
+    # IST wall-clock date — matches /attendance/today's fallback and the
+    # IST date strings attendance rows are stored under.
+    today = now_ist_naive().strftime("%Y-%m-%d")
 
     # On-time flag for KPI: completed on or before the due date. If no
     # due date was set, treat as on-time (can't be late if no deadline).
@@ -415,7 +435,7 @@ async def uncomplete_task(
     if task.get("status") != "COMPLETED":
         raise HTTPException(400, "Task is not completed")
 
-    now = datetime.now(timezone.utc)
+    now = now_ist_naive()
 
     # 1. Reset the task
     await db.tasks.update_one(
@@ -516,7 +536,7 @@ async def add_comment(
         raise HTTPException(400, "Comment text required")
 
     user_id = str(user["_id"])
-    now = datetime.now(timezone.utc)
+    now = now_ist_naive()
 
     comment = {
         "taskId": id,

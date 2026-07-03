@@ -11,6 +11,7 @@ from typing import Optional
 from bson import ObjectId
 
 from database import db
+from utils.ist import now_ist_naive, iso_naive
 from utils.push import push_to_user, push_to_users
 from utils.realtime import publish as realtime_publish
 
@@ -32,7 +33,7 @@ async def create_notification(
     """Insert an in-app notification + fan-out via SSE. Never raises."""
     if not user_id:
         return
-    now = datetime.now(timezone.utc)
+    now = now_ist_naive()
     inserted_id = None
     try:
         result = await db.notifications.insert_one({

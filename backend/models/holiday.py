@@ -9,5 +9,6 @@ class HolidayCreate(BaseModel):
 
 
 class HolidayUpdate(BaseModel):
+    date: Optional[str] = None  # YYYY-MM-DD
     name: Optional[str] = None
     description: Optional[str] = None

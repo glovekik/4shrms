@@ -13,6 +13,7 @@ from bson import ObjectId
 from bson.errors import InvalidId
 
 from database import db
+from utils.ist import now_ist_naive, parse_client_to_ist_naive, iso_naive
 from utils.notify import notify_user
 
 from utils.dependencies import (
@@ -42,6 +43,7 @@ from models.attendance import (
     AttendanceCheckOut,
     AttendanceManualUpsert,
 )
+from models.client_visit import ClientVisitCreate, ClientVisitCheckout
 
 router = APIRouter()
 
@@ -49,6 +51,7 @@ router = APIRouter()
 VALID_TYPES = [
     "OFFICE",
     "WFH",
+    "CLIENT",
     "LEAVE",
     "HOLIDAY",
 ]
@@ -99,6 +102,20 @@ async def checkin(
                     f"{int(OFFICE_RADIUS_METERS)}m)",
                 )
 
+    # CLIENT check-ins capture the client site location; reject if the person
+    # is actually at the office (they should use OFFICE instead).
+    if attendance_type == "CLIENT":
+        if data.latitude is None or data.longitude is None:
+            raise HTTPException(400, "Location required for client check-in")
+        guard_lat = OFFICE_LATITUDE if is_geofence_configured() else CLIENT_GUARD_OFFICE_LAT
+        guard_lng = OFFICE_LONGITUDE if is_geofence_configured() else CLIENT_GUARD_OFFICE_LNG
+        guard_radius = OFFICE_RADIUS_METERS or 200.0
+        if haversine_meters(guard_lat, guard_lng, data.latitude, data.longitude) <= guard_radius:
+            raise HTTPException(
+                400,
+                "You're at the office — use Office instead of Client.",
+            )
+
     existing = await db.attendance.find_one({
 
         "userId": user_id,
@@ -112,21 +129,16 @@ async def checkin(
             detail="Attendance already exists for this date"
         )
 
-    # Prefer the device-supplied timestamp so the saved time matches
-    # the user's local moment exactly. Falls back to server now() when
-    # the field is absent (older clients).
+    # Store the check-in as IST wall-clock (see utils/ist.py) so the raw DB
+    # reads in office time. Prefer the device-supplied instant; fall back to
+    # server now() for older clients.
     if data.checkIn:
         try:
-            client_time = datetime.fromisoformat(
-                data.checkIn.replace("Z", "+00:00")
-            )
-            if client_time.tzinfo is None:
-                client_time = client_time.replace(tzinfo=timezone.utc)
-            current_time = client_time.astimezone(timezone.utc)
+            current_time = parse_client_to_ist_naive(data.checkIn)
         except (TypeError, ValueError):
             raise HTTPException(400, "Invalid checkIn timestamp")
     else:
-        current_time = datetime.now(timezone.utc)
+        current_time = now_ist_naive()
     late_flag = is_late(current_time)
 
     attendance = {
@@ -159,6 +171,10 @@ async def checkin(
         "capturedLongitude":
         data.longitude,
 
+        "clientAddress":
+        (data.clientAddress or "").strip()
+        if attendance_type == "CLIENT" else None,
+
         "createdAt":
         current_time,
 
@@ -169,6 +185,40 @@ async def checkin(
     await db.attendance.insert_one(
         attendance
     )
+
+    # For client check-ins, tell the reporting manager + HR where the person
+    # is working from (mirrors the old client-location notification).
+    if attendance_type == "CLIENT":
+        try:
+            actor = None
+            try:
+                actor = await db.users.find_one({"_id": ObjectId(user_id)})
+            except (InvalidId, TypeError):
+                actor = None
+            name = (actor or {}).get("name") or "A teammate"
+            where = (
+                (data.clientAddress or "").strip()
+                or f"{data.latitude:.5f}, {data.longitude:.5f}"
+            )
+            recipients: set[str] = set()
+            async for hr in db.users.find({"role": "HR"}, {"_id": 1}):
+                recipients.add(str(hr["_id"]))
+            if actor and actor.get("reportingManagerId"):
+                recipients.add(str(actor["reportingManagerId"]))
+            recipients.discard(user_id)
+            for rid in recipients:
+                try:
+                    await notify_user(
+                        rid,
+                        "client_location",
+                        "Client check-in",
+                        f"{name} checked in from a client location — {where}.",
+                        {"type": "client_location", "userId": user_id, "date": today},
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     return {
         "message":
@@ -210,19 +260,15 @@ async def checkout(
             detail="Attendance not found"
         )
 
-    # Honour the device-supplied checkOut timestamp; fall back to now().
+    # Honour the device-supplied checkOut timestamp (stored as IST wall-clock);
+    # fall back to now().
     if data.checkOut:
         try:
-            client_time = datetime.fromisoformat(
-                data.checkOut.replace("Z", "+00:00")
-            )
-            if client_time.tzinfo is None:
-                client_time = client_time.replace(tzinfo=timezone.utc)
-            current_time = client_time.astimezone(timezone.utc)
+            current_time = parse_client_to_ist_naive(data.checkOut)
         except (TypeError, ValueError):
             raise HTTPException(400, "Invalid checkOut timestamp")
     else:
-        current_time = datetime.now(timezone.utc)
+        current_time = now_ist_naive()
 
     classification = classify_on_checkout(
         existing.get("checkIn"),
@@ -279,7 +325,7 @@ async def get_today(
 
     # Prefer the client-supplied date (YYYY-MM-DD) so it matches
     # whatever date /checkin used. Fall back to server local date.
-    today = date or datetime.now().strftime(
+    today = date or now_ist_naive().strftime(
         "%Y-%m-%d"
     )
 
@@ -305,6 +351,9 @@ async def get_today(
             "attendanceType"
         ),
 
+        "clientAddress":
+        record.get("clientAddress"),
+
         "status":
         record.get(
             "status"
@@ -319,17 +368,9 @@ async def get_today(
         "overtimeHours":
         record.get("overtimeHours", 0.0),
 
-        "checkIn":
-        record.get("checkIn")
-        .isoformat() + "Z"
-        if record.get("checkIn")
-        else None,
+        "checkIn": iso_naive(record.get("checkIn")),
 
-        "checkOut":
-        record.get("checkOut")
-        .isoformat() + "Z"
-        if record.get("checkOut")
-        else None,
+        "checkOut": iso_naive(record.get("checkOut")),
 
         "workNotes":
         record.get(
@@ -397,20 +438,10 @@ async def get_history(
             "overtimeHours":
             item.get("overtimeHours", 0.0),
 
-            # Always emit explicit-UTC ISO so the client doesn't
-            # interpret a naive string as local time. Motor returns
-            # tz-naive datetimes from BSON, so we append "Z" manually.
-            "checkIn":
-            item.get("checkIn")
-            .isoformat() + "Z"
-            if item.get("checkIn")
-            else None,
+            # Stored as IST wall-clock (see utils/ist.py) — emit as-is, no Z.
+            "checkIn": iso_naive(item.get("checkIn")),
 
-            "checkOut":
-            item.get("checkOut")
-            .isoformat() + "Z"
-            if item.get("checkOut")
-            else None,
+            "checkOut": iso_naive(item.get("checkOut")),
 
             "workNotes":
             item.get(
@@ -522,17 +553,14 @@ async def update_attendance(
         data.workNotes or "",
 
         "updatedAt":
-        datetime.now(timezone.utc),
+        now_ist_naive(),
     }
 
     if data.checkIn:
 
         try:
 
-            update_data["checkIn"] = \
-                datetime.fromisoformat(
-                    data.checkIn.replace("Z", "+00:00")
-                )
+            update_data["checkIn"] = parse_client_to_ist_naive(data.checkIn)
 
         except (TypeError, ValueError):
 
@@ -545,10 +573,7 @@ async def update_attendance(
 
         try:
 
-            update_data["checkOut"] = \
-                datetime.fromisoformat(
-                    data.checkOut.replace("Z", "+00:00")
-                )
+            update_data["checkOut"] = parse_client_to_ist_naive(data.checkOut)
 
         except (TypeError, ValueError):
 
@@ -657,9 +682,7 @@ async def manual_attendance(
 
     if data.checkIn:
         try:
-            parsed_in = datetime.fromisoformat(
-                data.checkIn.replace("Z", "+00:00")
-            )
+            parsed_in = parse_client_to_ist_naive(data.checkIn)
         except (TypeError, ValueError):
             raise HTTPException(
                 400,
@@ -668,9 +691,7 @@ async def manual_attendance(
 
     if data.checkOut:
         try:
-            parsed_out = datetime.fromisoformat(
-                data.checkOut.replace("Z", "+00:00")
-            )
+            parsed_out = parse_client_to_ist_naive(data.checkOut)
         except (TypeError, ValueError):
             raise HTTPException(
                 400,
@@ -687,7 +708,7 @@ async def manual_attendance(
             "checkOut cannot be before checkIn",
         )
 
-    now = datetime.now(timezone.utc)
+    now = now_ist_naive()
 
     existing = await db.attendance.find_one({
         "userId": user_id,
@@ -746,19 +767,193 @@ async def manual_attendance(
         "date": saved.get("date"),
         "attendanceType": saved.get("attendanceType"),
         "status": saved.get("status"),
-        "checkIn": (
-            saved["checkIn"].isoformat() + "Z"
-            if saved.get("checkIn") else None
-        ),
-        "checkOut": (
-            saved["checkOut"].isoformat() + "Z"
-            if saved.get("checkOut") else None
-        ),
+        "checkIn": iso_naive(saved.get("checkIn")),
+        "checkOut": iso_naive(saved.get("checkOut")),
         "workNotes": saved.get("workNotes", ""),
         "autoClosedByCron": saved.get(
             "autoClosedByCron", False
         ),
     }
+
+
+# ================= CLIENT LOCATION VISITS =================
+# An employee working from a client site logs their GPS location (+ optional
+# reverse-geocoded address and a note). Stored in `client_visits`, separate
+# from the attendance row, and surfaced to their manager + HR.
+#
+# Fallback office coordinates for the "you're at the office" guard, used only
+# when the env geofence (OFFICE_LATITUDE/LONGITUDE) isn't configured. Kept in
+# sync with the app's src/utils/location.ts OFFICE constant.
+CLIENT_GUARD_OFFICE_LAT = 16.507020515758303
+CLIENT_GUARD_OFFICE_LNG = 80.62279856266548
+
+
+def _serialize_client_visit(v: dict, user: Optional[dict] = None) -> dict:
+    return {
+        "id": str(v["_id"]),
+        "userId": v.get("userId"),
+        "user": user,
+        "date": v.get("date"),
+        "latitude": v.get("latitude"),
+        "longitude": v.get("longitude"),
+        "address": v.get("address") or "",
+        "notes": v.get("notes") or "",
+        # capturedAt is the client check-in instant; checkOut closes the visit.
+        "capturedAt": iso_naive(v.get("capturedAt")),
+        "checkOut": iso_naive(v.get("checkOut")),
+        "hoursWorked": v.get("hoursWorked", 0.0),
+    }
+
+
+@router.post("/client-location")
+async def submit_client_location(
+    data: ClientVisitCreate,
+    user_id: str = Depends(get_current_user),
+):
+    """Employee logs that they're working from a client location today."""
+    # A "client location" that's actually the office is a normal check-in —
+    # reject it so client visits stay limited to genuine off-site work.
+    # Prefer the configured env office; when the geofence env isn't set, fall
+    # back to the app's known office coordinates so the limit still applies.
+    if is_geofence_configured():
+        office_lat = OFFICE_LATITUDE
+        office_lng = OFFICE_LONGITUDE
+    else:
+        office_lat = CLIENT_GUARD_OFFICE_LAT
+        office_lng = CLIENT_GUARD_OFFICE_LNG
+    office_radius = OFFICE_RADIUS_METERS or 200.0
+    office_dist = haversine_meters(
+        office_lat, office_lng, data.latitude, data.longitude
+    )
+    if office_dist <= office_radius:
+        raise HTTPException(
+            400,
+            "You're at the office — check in normally instead of "
+            "logging a client location.",
+        )
+
+    if data.capturedAt:
+        try:
+            when = parse_client_to_ist_naive(data.capturedAt)
+        except (TypeError, ValueError):
+            when = now_ist_naive()
+    else:
+        when = now_ist_naive()
+
+    doc = {
+        "userId": user_id,
+        "date": data.date,
+        "latitude": data.latitude,
+        "longitude": data.longitude,
+        "address": (data.address or "").strip(),
+        "notes": (data.notes or "").strip(),
+        "capturedAt": when,
+        "createdAt": when,
+        "updatedAt": when,
+    }
+    result = await db.client_visits.insert_one(doc)
+
+    # Notify the reporting manager + all HR so it shows up for them.
+    try:
+        actor = None
+        try:
+            actor = await db.users.find_one({"_id": ObjectId(user_id)})
+        except (InvalidId, TypeError):
+            actor = None
+        name = (actor or {}).get("name") or "A teammate"
+        where = doc["address"] or f"{data.latitude:.5f}, {data.longitude:.5f}"
+
+        recipients: set[str] = set()
+        async for hr in db.users.find({"role": "HR"}, {"_id": 1}):
+            recipients.add(str(hr["_id"]))
+        if actor and actor.get("reportingManagerId"):
+            recipients.add(str(actor["reportingManagerId"]))
+        recipients.discard(user_id)
+
+        for rid in recipients:
+            try:
+                await notify_user(
+                    rid,
+                    "client_location",
+                    "Client-location check-in",
+                    f"{name} is working from a client location — {where}.",
+                    {
+                        "type": "client_location",
+                        "userId": user_id,
+                        "date": data.date,
+                    },
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return {"message": "Client location saved", "id": str(result.inserted_id)}
+
+
+@router.get("/client-location/mine")
+async def my_client_locations(
+    limit: int = Query(30, ge=1, le=200),
+    user_id: str = Depends(get_current_user),
+):
+    """The caller's own recent client-location visits (newest first)."""
+    out: list[dict] = []
+    cursor = (
+        db.client_visits.find({"userId": user_id})
+        .sort("capturedAt", -1)
+        .limit(limit)
+    )
+    async for v in cursor:
+        out.append(_serialize_client_visit(v))
+    return out
+
+
+@router.post("/client-location/checkout")
+async def checkout_client_location(
+    data: ClientVisitCheckout,
+    user_id: str = Depends(get_current_user),
+):
+    """Close the caller's open client-location visit for today: stamps the
+    check-out time, computes hours worked, and optionally saves work notes."""
+    today = now_ist_naive().strftime("%Y-%m-%d")
+    visit = await db.client_visits.find_one(
+        {
+            "userId": user_id,
+            "date": today,
+            "$or": [{"checkOut": None}, {"checkOut": {"$exists": False}}],
+        },
+        sort=[("capturedAt", -1)],
+    )
+    if not visit:
+        raise HTTPException(404, "No open client-location visit to check out")
+
+    if data.checkOut:
+        try:
+            out_at = parse_client_to_ist_naive(data.checkOut)
+        except (TypeError, ValueError):
+            out_at = now_ist_naive()
+    else:
+        out_at = now_ist_naive()
+
+    started = visit.get("capturedAt")
+    hours = 0.0
+    if isinstance(started, datetime):
+        hours = max(0.0, (out_at - started).total_seconds() / 3600.0)
+        hours = round(hours, 2)
+
+    set_fields: dict = {
+        "checkOut": out_at,
+        "hoursWorked": hours,
+        "updatedAt": out_at,
+    }
+    if data.notes is not None and data.notes.strip():
+        set_fields["notes"] = data.notes.strip()
+
+    await db.client_visits.update_one(
+        {"_id": visit["_id"]}, {"$set": set_fields}
+    )
+    visit.update(set_fields)
+    return _serialize_client_visit(visit)
 
 
 # ================= HR: ALL EMPLOYEES' ATTENDANCE =================
@@ -789,7 +984,7 @@ async def hr_list_attendance(
             raise HTTPException(400, "Invalid month (YYYY-MM required)")
         query["date"] = {"$regex": f"^{month}-"}
     else:
-        query["date"] = datetime.now().strftime("%Y-%m-%d")
+        query["date"] = now_ist_naive().strftime("%Y-%m-%d")
 
     if userId:
         query["userId"] = userId
@@ -825,19 +1020,14 @@ async def hr_list_attendance(
             "user": user_map.get(r.get("userId")),
             "date": r.get("date"),
             "attendanceType": r.get("attendanceType"),
+            "clientAddress": r.get("clientAddress"),
             "status": r.get("status"),
             "isLate": r.get("isLate", False),
             "hoursWorked": r.get("hoursWorked", 0.0),
             "overtimeHours": r.get("overtimeHours", 0.0),
-            # Anchor as UTC so the client renders correctly in any tz.
-            "checkIn": (
-                r["checkIn"].isoformat() + "Z"
-                if r.get("checkIn") else None
-            ),
-            "checkOut": (
-                r["checkOut"].isoformat() + "Z"
-                if r.get("checkOut") else None
-            ),
+            # Stored as IST wall-clock (see utils/ist.py) — emit as-is, no Z.
+            "checkIn": iso_naive(r.get("checkIn")),
+            "checkOut": iso_naive(r.get("checkOut")),
             "workNotes": r.get("workNotes", ""),
         })
 

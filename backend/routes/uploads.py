@@ -15,7 +15,8 @@ across the app and which the backend serves back via the same path.
 import os
 import uuid
 from pathlib import Path
-from datetime import datetime
+
+from utils.ist import now_ist_naive
 
 import aiofiles
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
@@ -87,7 +88,7 @@ async def upload_file(
     if not file or not file.filename:
         raise HTTPException(400, "file is required")
 
-    today = datetime.now()
+    today = now_ist_naive()
     year_dir = f"{today.year:04d}"
     month_dir = f"{today.month:02d}"
 
