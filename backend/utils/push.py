@@ -9,9 +9,47 @@ from typing import Iterable, Optional
 import httpx
 
 from database import db
+from utils.fcm import send_fcm
 
 
 EXPO_URL = "https://exp.host/--/api/v2/push/send"
+
+
+def _is_expo(token: str) -> bool:
+    """Expo relay tokens look like ExponentPushToken[...] / ExpoPushToken[...].
+    Anything else is a native FCM registration token (Android)."""
+    return isinstance(token, str) and (
+        token.startswith("ExponentPushToken") or token.startswith("ExpoPushToken")
+    )
+
+
+async def _dispatch(
+    tokens: list[str],
+    title: str,
+    body: str,
+    data: Optional[dict],
+    channel_id: Optional[str],
+    sound: str,
+) -> None:
+    """Route each token to the right transport: native tokens → FCM HTTP v1,
+    Expo tokens → Expo push. Prunes tokens FCM reports as dead."""
+    tokens = [t for t in tokens if t]
+    if not tokens:
+        return
+    expo = [t for t in tokens if _is_expo(t)]
+    fcm = [t for t in tokens if not _is_expo(t)]
+
+    if expo:
+        await _send_messages(
+            [_message(t, title, body, data, channel_id, sound) for t in expo]
+        )
+    if fcm:
+        invalid = await send_fcm(fcm, title, body, data, channel_id, sound)
+        if invalid:
+            try:
+                await db.push_tokens.delete_many({"token": {"$in": invalid}})
+            except Exception as e:
+                print(f"[push] prune invalid FCM tokens failed: {e}")
 
 
 async def _send_messages(messages: list[dict]) -> None:
@@ -61,11 +99,7 @@ async def push_to_user(
     if not tokens:
         return
 
-    payload = [
-        _message(token, title, body, data, channel_id, sound)
-        for token in tokens
-    ]
-    await _send_messages(payload)
+    await _dispatch(tokens, title, body, data, channel_id, sound)
 
 
 async def push_to_users(
@@ -91,8 +125,4 @@ async def push_to_users(
     if not tokens:
         return
 
-    payload = [
-        _message(token, title, body, data, channel_id, sound)
-        for token in tokens
-    ]
-    await _send_messages(payload)
+    await _dispatch(tokens, title, body, data, channel_id, sound)

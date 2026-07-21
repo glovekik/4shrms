@@ -5,7 +5,7 @@ from fastapi import (
     Query,
 )
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from typing import Optional
 
@@ -56,6 +56,81 @@ VALID_TYPES = [
     "HOLIDAY",
 ]
 
+# How many days back a still-open check-in still gates today's check-in.
+# Keeps the "finish your previous day" rule scoped to recent misses (incl. a
+# weekend gap) so a months-old forgotten check-out never locks someone out.
+PREV_DAY_BLOCK_WINDOW_DAYS = 7
+
+
+async def _unfinished_prev_checkins(
+    user_id: str, ref_date: str
+) -> list[dict]:
+    """Previous days the user forgot to check out of and hasn't corrected.
+
+    A forgotten check-out is auto-closed by the 00:01 cron with a placeholder
+    23:59:59 check-out and ``autoClosedByCron=True``. Returns the caller's rows
+    from a date earlier than ``ref_date`` (within PREV_DAY_BLOCK_WINDOW_DAYS)
+    that are either auto-closed OR (edge case: before the cron ran) still
+    CHECKED_IN, EXCLUDING any that already have a correction request in ANY
+    status — once the user has sent a correction, the day no longer nags or
+    blocks them. Sorted oldest-first.
+    """
+    try:
+        window_start = (
+            datetime.strptime(ref_date, "%Y-%m-%d")
+            - timedelta(days=PREV_DAY_BLOCK_WINDOW_DAYS)
+        ).strftime("%Y-%m-%d")
+    except (TypeError, ValueError):
+        window_start = None
+
+    date_filter: dict = {"$lt": ref_date}
+    if window_start:
+        date_filter["$gte"] = window_start
+
+    records: list[dict] = []
+    async for r in db.attendance.find(
+        {
+            "userId": user_id,
+            "date": date_filter,
+            "$or": [
+                {"status": "CHECKED_IN"},
+                {"autoClosedByCron": True},
+            ],
+        },
+        {"date": 1, "checkIn": 1, "checkOut": 1, "attendanceType": 1},
+    ).sort("date", 1):
+        records.append(r)
+
+    if not records:
+        return []
+
+    # Drop any row the user has already filed a correction for (any status).
+    att_ids = [str(r["_id"]) for r in records]
+    handled: set[str] = set()
+    async for cr in db.correction_requests.find(
+        {"attendanceId": {"$in": att_ids}},
+        {"attendanceId": 1},
+    ):
+        if cr.get("attendanceId"):
+            handled.add(cr["attendanceId"])
+
+    return [r for r in records if str(r["_id"]) not in handled]
+
+
+def _serialize_unfinished(records: list[dict]) -> list[dict]:
+    return [
+        {
+            "id": str(r["_id"]),
+            "date": r.get("date"),
+            "checkIn": iso_naive(r.get("checkIn")),
+            # Placeholder 23:59:59 from auto-close; the app pre-fills it so the
+            # user adjusts to their real leave time.
+            "checkOut": iso_naive(r.get("checkOut")),
+            "attendanceType": r.get("attendanceType"),
+        }
+        for r in records
+    ]
+
 
 # ================= CHECK IN =================
 @router.post("/checkin")
@@ -75,6 +150,32 @@ async def checkin(
         raise HTTPException(
             status_code=400,
             detail="Invalid attendance type"
+        )
+
+    # ---- Unfinished previous day gate ----
+    # A user who forgot to check out on an earlier day has that record
+    # auto-closed at 11:59 PM with a placeholder time (autoClosedByCron). Since
+    # that time is almost certainly wrong, they cannot check in today until
+    # they file an attendance correction request for the forgotten day
+    # (approval can follow later). Filing the request clears this gate (see
+    # _unfinished_prev_checkins). Scoped to recent misses so an old forgotten
+    # day can't lock someone out forever.
+    unfinished = await _unfinished_prev_checkins(user_id, today)
+    if unfinished:
+        dates = [r["date"] for r in unfinished if r.get("date")]
+        shown = ", ".join(dates[:5])
+        more = f" and {len(dates) - 5} more" if len(dates) > 5 else ""
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "PREV_DAY_INCOMPLETE",
+                "message": (
+                    f"You didn't check out on {shown}{more}. "
+                    "Send a correction request for that day to check in today."
+                ),
+                "dates": dates,
+                "records": _serialize_unfinished(unfinished),
+            },
         )
 
     # Server-side geofence for OFFICE check-ins.
@@ -260,6 +361,26 @@ async def checkout(
             detail="Attendance not found"
         )
 
+    # Only an open, checked-in day can be checked out. Without these guards a
+    # checkout POST could overwrite a leave / absent / holiday row (which has
+    # no checkIn) — classify_on_checkout(None, now) would flip it to HALF_DAY
+    # with 0 hours and destroy the record — or double-check-out a finished day.
+    if not existing.get("checkIn"):
+        raise HTTPException(
+            status_code=400,
+            detail="You haven't checked in for this day.",
+        )
+    if existing.get("status") in ("ON_LEAVE", "ABSENT", "HOLIDAY"):
+        raise HTTPException(
+            status_code=400,
+            detail="This day is marked as leave or holiday and can't be checked out.",
+        )
+    if existing.get("checkOut"):
+        raise HTTPException(
+            status_code=400,
+            detail="You've already checked out for this day.",
+        )
+
     # Honour the device-supplied checkOut timestamp (stored as IST wall-clock);
     # fall back to now().
     if data.checkOut:
@@ -312,6 +433,21 @@ async def checkout(
         "hoursWorked": classification["hoursWorked"],
         "overtimeHours": classification["overtimeHours"],
     }
+
+
+# ================= UNFINISHED PREVIOUS DAYS =================
+@router.get("/unfinished")
+async def get_unfinished(
+    date: str | None = None,
+    user_id: str = Depends(get_current_user),
+):
+    """Previous days the caller forgot to check out of and hasn't yet filed a
+    correction request for. The app polls this on open and prompts the user to
+    send a correction request for each one. `date` is the client's today
+    (YYYY-MM-DD); falls back to server IST date."""
+    today = date or now_ist_naive().strftime("%Y-%m-%d")
+    unfinished = await _unfinished_prev_checkins(user_id, today)
+    return {"records": _serialize_unfinished(unfinished)}
 
 
 # ================= TODAY =================
@@ -1010,6 +1146,7 @@ async def hr_list_attendance(
                 "name": u.get("name"),
                 "email": u.get("email"),
                 "employeeCode": u.get("employeeCode"),
+                "profilePictureUrl": u.get("profilePictureUrl"),
             }
 
     out: list[dict] = []
@@ -1029,6 +1166,73 @@ async def hr_list_attendance(
             "checkIn": iso_naive(r.get("checkIn")),
             "checkOut": iso_naive(r.get("checkOut")),
             "workNotes": r.get("workNotes", ""),
+            "unpaid": bool(r.get("unpaid", False)),
         })
 
     return out
+
+
+@hr_router.post("/attendance/unpaid-leave")
+async def hr_mark_unpaid_leave(
+    body: dict,
+    hr: dict = Depends(require_hr_or_ceo),
+):
+    """HR marks (or clears) a day as UNPAID leave for one employee.
+
+    Unpaid leave is a LEAVE-type day that is NOT a paid/worked day, so payroll
+    excludes it from `attended` and it becomes Loss-of-Pay. Paid leave, by
+    contrast, is what an employee requests against their leave balance.
+
+    Body: { userId: str, date: "YYYY-MM-DD", unpaid: bool }
+      unpaid=true  → upsert an unpaid LEAVE row for that day
+      unpaid=false → remove the unpaid-leave marker (deletes the row)
+    """
+    user_id = (body.get("userId") or "").strip()
+    date_str = (body.get("date") or "").strip()
+    make_unpaid = bool(body.get("unpaid", True))
+
+    if not user_id or not date_str:
+        raise HTTPException(400, "userId and date are required")
+    try:
+        datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(400, "date must be YYYY-MM-DD")
+    try:
+        ObjectId(user_id)
+    except (InvalidId, TypeError):
+        raise HTTPException(400, "Invalid userId")
+
+    now = now_ist_naive()
+
+    if not make_unpaid:
+        # Undo: only remove a row that IS an unpaid-leave marker, so we never
+        # delete a genuine attendance record.
+        await db.attendance.delete_one(
+            {"userId": user_id, "date": date_str, "unpaid": True}
+        )
+        return {"message": "Unpaid leave removed", "unpaid": False}
+
+    # Mark as unpaid leave — overwrite/create the day's row.
+    await db.attendance.update_one(
+        {"userId": user_id, "date": date_str},
+        {
+            "$set": {
+                "userId": user_id,
+                "date": date_str,
+                "attendanceType": "LEAVE",
+                "status": "ON_LEAVE",
+                "unpaid": True,
+                "checkIn": None,
+                "checkOut": None,
+                "hoursWorked": 0.0,
+                "isLate": False,
+                "workNotes": "Unpaid leave (marked by HR)",
+                "markedUnpaidBy": str(hr["_id"]),
+                "autoClosedByCron": False,
+                "updatedAt": now,
+            },
+            "$setOnInsert": {"createdAt": now},
+        },
+        upsert=True,
+    )
+    return {"message": "Marked as unpaid leave", "unpaid": True}

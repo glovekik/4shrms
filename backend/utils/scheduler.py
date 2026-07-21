@@ -39,16 +39,20 @@ scheduler = AsyncIOScheduler(timezone=_TZ)
 async def auto_close_attendance() -> None:
     """Runs daily at 00:01 server local time.
 
-    Closes any attendance still in CHECKED_IN state from a date earlier than
-    today: sets checkOut to 23:59:59 of that record's date, status=COMPLETED,
-    and flags `autoClosedByCron=True` so the user can request a correction.
+    Safety net for forgotten check-outs: closes any attendance still in
+    CHECKED_IN state from a date earlier than today by stamping a placeholder
+    checkOut of 23:59:59 on that record's date, status=COMPLETED, and
+    flags `autoClosedByCron=True`.
 
-    Each auto-close spends one of the user's monthly auto-checkout credits
-    (default 5) and notifies the user + their reporting manager + HR.
+    The placeholder time is almost certainly wrong, so the next day the app
+    prompts the user to file an attendance correction request with their real
+    check-out time (see routes/attendance.py: the /unfinished endpoint + the
+    check-in PREV_DAY_INCOMPLETE gate, which surface autoClosedByCron records
+    that don't yet have a correction request). No monthly quota — auto-close is
+    just a guardrail so the day is never left hanging.
     """
     from bson import ObjectId
     from bson.errors import InvalidId
-    from utils.ist import now_ist_naive
     from utils.notify import notify_user
 
     today = now_ist_naive().strftime("%Y-%m-%d")
@@ -58,28 +62,16 @@ async def auto_close_attendance() -> None:
         "date": {"$lt": today},
     })
 
-    # Resolve HR recipients once (few HR users).
-    hr_ids: list[str] = []
-    async for hr in db.users.find({"role": "HR"}, {"_id": 1}):
-        hr_ids.append(str(hr["_id"]))
-
     closed = 0
 
     async for record in cursor:
-
         try:
-            record_date = datetime.strptime(
-                record["date"], "%Y-%m-%d"
-            )
+            record_date = datetime.strptime(record["date"], "%Y-%m-%d")
         except (ValueError, TypeError, KeyError):
             continue
 
         # 23:59:59 IST wall-clock (naive) — attendance times are stored in IST.
-        check_out = record_date.replace(
-            hour=23,
-            minute=59,
-            second=59,
-        )
+        check_out = record_date.replace(hour=23, minute=59, second=59)
 
         await db.attendance.update_one(
             {"_id": record["_id"]},
@@ -94,53 +86,25 @@ async def auto_close_attendance() -> None:
         )
         closed += 1
 
-        # --- spend a credit + notify ---
+        # Nudge the user to correct the placeholder time (no quota wording).
         uid = record.get("userId")
         if not uid:
             continue
-        try:
-            user = await db.users.find_one({"_id": ObjectId(uid)})
-        except (InvalidId, TypeError):
-            user = None
-        if not user:
-            continue
-
-        left = max(0, int(user.get("autoCheckoutQuota", 5)) - 1)
-        await db.users.update_one(
-            {"_id": user["_id"]}, {"$set": {"autoCheckoutQuota": left}}
-        )
-        name = user.get("name") or "A teammate"
         d = record["date"]
         try:
             await notify_user(
-                uid, "auto_checkout",
-                "Auto check-out used",
-                f"You didn't check out on {d}, so we auto-closed it at 11:59 PM. "
-                f"{left} of 5 auto check-outs left this month.",
-                {"type": "auto_checkout", "date": d, "left": left},
+                uid,
+                "auto_checkout",
+                "You forgot to check out",
+                f"We closed your {d} attendance at 11:59 PM because you didn't "
+                f"check out. Send a correction request with the time you "
+                f"actually left.",
+                {"type": "auto_checkout", "date": d},
             )
         except Exception:
             pass
 
-        recipients = set(hr_ids)
-        if user.get("reportingManagerId"):
-            recipients.add(str(user["reportingManagerId"]))
-        recipients.discard(uid)
-        for rid in recipients:
-            try:
-                await notify_user(
-                    rid, "auto_checkout_report",
-                    "Team member auto checked-out",
-                    f"{name} forgot to check out on {d} — auto-closed. "
-                    f"{left}/5 credits left.",
-                    {"type": "auto_checkout_report", "userId": uid, "date": d},
-                )
-            except Exception:
-                pass
-
-    print(
-        f"[scheduler] auto_close_attendance: closed {closed} record(s)"
-    )
+    print(f"[scheduler] auto_close_attendance: closed {closed} record(s)")
 
 
 def _accrual_history_entries(
@@ -187,9 +151,6 @@ async def monthly_leave_accrual() -> None:
     year = today.year
     current_month = today.month
     now = datetime.now(timezone.utc)
-
-    # Refill everyone's monthly auto-checkout credits back to 5.
-    await db.users.update_many({}, {"$set": {"autoCheckoutQuota": 5}})
 
     leave_types = []
     async for t in db.leave_types.find(
@@ -313,7 +274,7 @@ async def monthly_leave_accrual() -> None:
 
 # ================= DAILY ABSENT MARKER =================
 async def daily_absent_marker() -> None:
-    """Runs at 00:30 server local time (after auto_close_attendance).
+    """Runs at 00:30 server local time.
 
     For yesterday: every Active user with no attendance record AND no
     approved leave covering that date AND yesterday wasn't a weekend or
@@ -824,6 +785,13 @@ def _acquire_singleton_lock() -> bool:
 
 
 def start_scheduler() -> None:
+    # Local/dev kill-switch: set DISABLE_SCHEDULER=1 to run the API without any
+    # cron jobs (auto-close, reminders, emails, accrual). Prevents a local run
+    # pointed at a shared DB from nudging real users.
+    if os.getenv("DISABLE_SCHEDULER", "").strip() in ("1", "true", "TRUE", "yes"):
+        print("[scheduler] DISABLE_SCHEDULER set — cron jobs NOT started")
+        return
+
     if not _acquire_singleton_lock():
         print(
             "[scheduler] another worker owns the scheduler — skipping start "

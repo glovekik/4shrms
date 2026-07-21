@@ -708,6 +708,7 @@ async def get_team(
                 "id": str(lead_user["_id"]),
                 "name": lead_user.get("name"),
                 "email": lead_user.get("email"),
+                "profilePictureUrl": lead_user.get("profilePictureUrl"),
             }
             serialized["leadName"] = lead_user.get("name")
 

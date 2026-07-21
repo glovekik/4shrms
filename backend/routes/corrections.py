@@ -183,6 +183,7 @@ async def _get_user_basics(user_ids) -> dict:
             "id": str(u["_id"]),
             "name": u.get("name"),
             "email": u.get("email"),
+            "profilePictureUrl": u.get("profilePictureUrl"),
         }
     return result
 
@@ -649,6 +650,23 @@ async def _decide_correction_internal(
             att_updates["isLate"] = classification["isLate"]
         elif merged_in:
             att_updates["status"] = "CHECKED_IN"
+
+        # Guard: moving the record onto a date that already has a row for this
+        # user would violate the unique (userId, date) index and 500. Reject
+        # with a clear message instead of crashing.
+        new_date = att_updates.get("date")
+        if new_date and new_date != existing_att.get("date"):
+            clash = await db.attendance.find_one({
+                "userId": existing_att.get("userId"),
+                "date": new_date,
+                "_id": {"$ne": att_oid},
+            })
+            if clash:
+                raise HTTPException(
+                    400,
+                    f"There's already an attendance record on {new_date}. "
+                    "Delete or fix that one before moving this record there.",
+                )
 
         att_result = await db.attendance.update_one(
             {"_id": att_oid},

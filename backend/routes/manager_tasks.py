@@ -216,6 +216,7 @@ async def list_team_tasks(
                 "id": str(u["_id"]),
                 "name": u.get("name"),
                 "email": u.get("email"),
+                "profilePictureUrl": u.get("profilePictureUrl"),
             }
 
     out: list[dict] = []
@@ -374,6 +375,7 @@ async def team_attendance(
                 "name": u.get("name"),
                 "email": u.get("email"),
                 "employeeCode": u.get("employeeCode"),
+                "profilePictureUrl": u.get("profilePictureUrl"),
             }
 
     out: list[dict] = []
@@ -446,6 +448,7 @@ async def team_leave_balances(
             "name": u.get("name"),
             "email": u.get("email"),
             "employeeCode": u.get("employeeCode"),
+            "profilePictureUrl": u.get("profilePictureUrl"),
         }
 
     # Pull balances + types in batches.
@@ -486,7 +489,7 @@ async def team_leave_balances(
     out: list[dict] = []
     for uid in report_ids:
         out.append({
-            "user": user_map.get(uid, {"id": uid, "name": None, "email": None}),
+            "user": user_map.get(uid, {"id": uid, "name": None, "email": None, "profilePictureUrl": None}),
             "balances": by_user.get(uid, []),
         })
     # Stable order by name so the UI list doesn't reshuffle.
@@ -554,6 +557,7 @@ async def team_client_locations(
                 "name": u.get("name"),
                 "email": u.get("email"),
                 "employeeCode": u.get("employeeCode"),
+                "profilePictureUrl": u.get("profilePictureUrl"),
             }
 
     return [

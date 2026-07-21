@@ -75,6 +75,7 @@ async def _get_user_basics(user_ids) -> dict:
             "id": str(u["_id"]),
             "name": u.get("name"),
             "email": u.get("email"),
+            "profilePictureUrl": u.get("profilePictureUrl"),
         }
     return result
 
@@ -245,6 +246,7 @@ async def _insert_message(
         "id": user_id,
         "name": user.get("name"),
         "email": user.get("email"),
+        "profilePictureUrl": user.get("profilePictureUrl"),
     }
 
     author_name = user.get("name") or "Someone"
@@ -412,12 +414,11 @@ async def _edit_message(
     if msg.get("deleted"):
         raise HTTPException(400, "This message was deleted")
 
-    # "Both" rule: within the edit window AND not yet read by anyone else.
+    # Bounded only by the edit window now — authors may edit their own message
+    # even after others have read it.
     if not _within(msg.get("createdAt"), CHAT_EDIT_WINDOW_MINUTES):
         raise HTTPException(403, "Edit window has passed")
     reads = await _channel_reads(channel_type, channel_id)
-    if _read_by_others(msg, reads):
-        raise HTTPException(403, "Can't edit — already read by someone")
 
     text = (text or "").strip()
     if not text:
@@ -431,7 +432,7 @@ async def _edit_message(
         {"$set": {"text": text, "mentions": resolved, "editedAt": now}},
     )
     msg.update({"text": text, "mentions": resolved, "editedAt": now})
-    user_info = {"id": str(user["_id"]), "name": user.get("name"), "email": user.get("email")}
+    user_info = {"id": str(user["_id"]), "name": user.get("name"), "email": user.get("email"), "profilePictureUrl": user.get("profilePictureUrl")}
     return _serialize_message(msg, user_info, _read_by_others(msg, reads))
 
 
@@ -462,14 +463,12 @@ async def _delete_message(
         )
         return {"message": "Message deleted for you"}
 
-    # Delete for everyone: author only, within window AND not read by others.
+    # Delete for everyone: author only, within the delete window. Allowed even
+    # after others have read the message.
     if msg.get("userId") != user_id:
         raise HTTPException(403, "You can only delete your own messages")
     if not _within(msg.get("createdAt"), CHAT_DELETE_WINDOW_MINUTES):
         raise HTTPException(403, "Delete window has passed")
-    reads = await _channel_reads(channel_type, channel_id)
-    if _read_by_others(msg, reads):
-        raise HTTPException(403, "Can't delete for everyone — already read by someone")
 
     await db.chat_messages.update_one(
         {"_id": oid},

@@ -104,6 +104,7 @@ async def _user_basics(ids) -> dict:
             "id": str(u["_id"]),
             "name": u.get("name"),
             "email": u.get("email"),
+            "profilePictureUrl": u.get("profilePictureUrl"),
         }
     return result
 

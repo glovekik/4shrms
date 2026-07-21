@@ -209,15 +209,14 @@ async def healthz():
 # allow_credentials must be False when allow_origins=["*"]
 # (browsers reject the wildcard with credentials enabled).
 app.add_middleware(
-
     CORSMiddleware,
-
-    allow_origins=["*"],
-
-    allow_credentials=False,
-
+    allow_origins=[
+        "https://hrms.4sightai.com",
+        "http://localhost:3000",
+        "http://localhost:5173",
+    ],
+    allow_credentials=True,
     allow_methods=["*"],
-
     allow_headers=["*"],
 )
 

@@ -158,6 +158,7 @@ async def _fetch_user_info(user_id: Optional[str]) -> Optional[dict]:
         "id": str(u["_id"]),
         "name": u.get("name"),
         "email": u.get("email"),
+        "profilePictureUrl": u.get("profilePictureUrl"),
     }
 
 
@@ -179,6 +180,7 @@ async def _users_by_ids(user_ids) -> dict:
             "id": str(u["_id"]),
             "name": u.get("name"),
             "email": u.get("email"),
+            "profilePictureUrl": u.get("profilePictureUrl"),
         }
     return out
 

@@ -34,6 +34,7 @@ async def get_me(
         "id": str(user["_id"]),
         "name": user.get("name"),
         "email": user.get("email"),
+        "profilePictureUrl": user.get("profilePictureUrl"),
     }
 
 
@@ -100,6 +101,7 @@ async def list_user_directory(
             "name": u.get("name"),
             "email": u.get("email"),
             "tag": u.get("tag"),
+            "profilePictureUrl": u.get("profilePictureUrl"),
         })
 
     has_more = last_doc is not None and len(items) == limit and (

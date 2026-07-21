@@ -203,6 +203,7 @@ async def _user_basics(ids) -> dict:
             "name": u.get("name"),
             "email": u.get("email"),
             "employeeCode": u.get("employeeCode"),
+            "profilePictureUrl": u.get("profilePictureUrl"),
         }
     return result
 
@@ -475,19 +476,42 @@ async def process_payroll_run(
 
     for user_id in user_ids:
 
-        structure = await db.salary_structures.find_one({
+        # Use the salary structure that was effective DURING the run's month,
+        # not merely the current one — so a back-dated run after a raise pays
+        # the salary that applied then. A structure covers [effectiveFrom,
+        # effectiveTo]; effectiveTo=None means "still current". Dates are
+        # YYYY-MM-DD strings, so lexical comparison is chronological.
+        structure = None
+        async for st in db.salary_structures.find({
             "userId": user_id,
-            "effectiveTo": None,
-        })
+            "effectiveFrom": {"$lte": to_d},
+            "$or": [
+                {"effectiveTo": None},
+                {"effectiveTo": {"$gte": from_d}},
+            ],
+        }).sort("effectiveFrom", -1).limit(1):
+            structure = st
+        if not structure:
+            # Fallback: latest structure on file (covers records that predate
+            # proper effective-dating) so users aren't silently skipped.
+            async for st in db.salary_structures.find(
+                {"userId": user_id}
+            ).sort("effectiveFrom", -1).limit(1):
+                structure = st
         if not structure:
             skipped.append(user_id)
             continue
 
-        # Count attendance records this month — any present record
-        # (any attendanceType) counts as a paid day.
+        # Count paid days: any attendance row that ISN'T an ABSENT marker and
+        # isn't an HR-marked UNPAID leave. Present / late / half-day / paid-
+        # leave rows all count as paid; ABSENT-status rows (daily absent cron /
+        # correction placeholders) and unpaid-leave days must be excluded, or
+        # they'd be paid instead of docked as LOP.
         attended = await db.attendance.count_documents({
             "userId": user_id,
             "date": {"$gte": from_d, "$lte": to_d},
+            "status": {"$ne": "ABSENT"},
+            "unpaid": {"$ne": True},
         })
 
         # LOP = days where user was *expected* to work but didn't show up.

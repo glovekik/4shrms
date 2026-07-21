@@ -179,6 +179,7 @@ async def hr_dashboard(
                 "name": u.get("name"),
                 "birthday": bday,
                 "tag": u.get("tag"),
+                "profilePictureUrl": u.get("profilePictureUrl"),
             })
 
     # Employee distribution by department

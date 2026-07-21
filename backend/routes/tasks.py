@@ -95,6 +95,7 @@ async def _get_user_basics(user_ids) -> dict:
             "id": str(u["_id"]),
             "name": u.get("name"),
             "email": u.get("email"),
+            "profilePictureUrl": u.get("profilePictureUrl"),
         }
     return result
 
@@ -569,6 +570,7 @@ async def add_comment(
         "id": user_id,
         "name": user.get("name"),
         "email": user.get("email"),
+        "profilePictureUrl": user.get("profilePictureUrl"),
     }
 
     return _serialize_comment(comment, user_info)
