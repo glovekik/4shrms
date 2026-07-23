@@ -1,3 +1,26 @@
+# ===== secrets — never commit =====
+.env
+.env.*
 .env.bak
+backend/.env
+backend/.env.*
 backend/.env.bak
+
+# Firebase / Google service-account keys (these contain a private_key)
+sa.json
+backend/sa.json
+*service-account*.json
+*serviceaccount*.json
+*-adminsdk-*.json
+google-services.json
+
 seed_local_demo.py
+
+# ===== noise =====
+*.log
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.DS_Store

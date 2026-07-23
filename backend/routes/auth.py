@@ -472,12 +472,17 @@ async def get_me(
 
     if not user:
 
+        # 401, NOT 404. A signed token pointing at a user who no longer
+        # exists is a dead session, not a missing resource — and the client
+        # only treats 401 as "your session is over". Returning 404 here left
+        # the app sitting on "Could not load profile." with no way out.
+        # Matches get_current_user_doc, which already returns 401.
         raise HTTPException(
 
-            status_code=404,
+            status_code=401,
 
             detail=
-            "User not found"
+            "Session is no longer valid. Please sign in again."
         )
 
     # Team memberships — UI uses these to decide which sections/tabs to show.

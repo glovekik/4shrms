@@ -668,6 +668,29 @@ async def _decide_correction_internal(
                     "Delete or fix that one before moving this record there.",
                 )
 
+        # Atomically claim this request (PENDING→APPROVED) BEFORE mutating the
+        # attendance record. A correction is visible to BOTH the reporting
+        # manager and HR; without this, if both open it and each hits Approve,
+        # the second would double-apply. The first PENDING→APPROVED transition
+        # wins; the loser bails out here (before touching attendance) with 409.
+        claimed = await db.correction_requests.update_one(
+            {"_id": oid, "status": "PENDING"},
+            {
+                "$set": {
+                    "status": "APPROVED",
+                    "decidedBy": decider_id,
+                    "decidedByRole": decider_role,
+                    "decidedAt": now,
+                    "decisionNote": data.note or "",
+                    "updatedAt": now,
+                }
+            },
+        )
+        if claimed.modified_count == 0:
+            raise HTTPException(
+                409, "This request was already decided by another approver.",
+            )
+
         att_result = await db.attendance.update_one(
             {"_id": att_oid},
             {
@@ -680,19 +703,6 @@ async def _decide_correction_internal(
         if att_result.matched_count == 0:
             raise HTTPException(404, "Attendance record no longer exists")
 
-        await db.correction_requests.update_one(
-            {"_id": oid},
-            {
-                "$set": {
-                    "status": "APPROVED",
-                    "decidedBy": decider_id,
-                    "decidedByRole": decider_role,
-                    "decidedAt": now,
-                    "decisionNote": data.note or "",
-                    "updatedAt": now,
-                }
-            },
-        )
         await _notify_requester(
             req["userId"], "APPROVED", str(oid), data.note or "",
         )
@@ -705,9 +715,10 @@ async def _decide_correction_internal(
         )
         return {"message": "Correction approved and applied"}
 
-    # REJECT
-    await db.correction_requests.update_one(
-        {"_id": oid},
+    # REJECT — atomically claim (PENDING→REJECTED) so the other approver
+    # (manager/HR) can't also decide the same request.
+    rejected = await db.correction_requests.update_one(
+        {"_id": oid, "status": "PENDING"},
         {
             "$set": {
                 "status": "REJECTED",
@@ -719,6 +730,10 @@ async def _decide_correction_internal(
             }
         },
     )
+    if rejected.modified_count == 0:
+        raise HTTPException(
+            409, "This request was already decided by another approver.",
+        )
     await _notify_requester(
         req["userId"], "REJECTED", str(oid), data.note or "",
     )

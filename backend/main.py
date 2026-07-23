@@ -160,6 +160,11 @@ from routes.holidays import (
     hr_router as holidays_hr_router,
 )
 
+from routes.id_card import (
+    router as id_card_router,
+    hr_router as id_card_hr_router,
+)
+
 from routes.manual_attendance import (
     user_router as manual_attendance_user_router,
     manager_router as manual_attendance_manager_router,
@@ -757,6 +762,19 @@ app.include_router(
 app.include_router(
     files_router,
     tags=["Files"],
+)
+
+# ================= ID CARD (BADGE) =================
+# Employee submits a photo; HR approves before the card is ever rendered.
+app.include_router(
+    id_card_router,
+    prefix="/id-card",
+    tags=["ID Card"],
+)
+app.include_router(
+    id_card_hr_router,
+    prefix="/hr",
+    tags=["HR"],
 )
 
 # ================= PUBLIC (NO-AUTH) =================

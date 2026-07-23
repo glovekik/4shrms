@@ -2,6 +2,7 @@ import base64
 import json
 import re
 from datetime import datetime, timezone
+from utils.ist import now_ist_naive, IST
 from fastapi import APIRouter, Depends, HTTPException, Query
 from bson import ObjectId
 from bson.errors import InvalidId
@@ -279,11 +280,16 @@ async def my_chat_unread(user_id: str = Depends(get_current_user)):
     ):
         team_ids.append(str(t["_id"]))
 
+    # chat_messages.createdAt is stored as IST wall-clock (naive). Compare the
+    # read-marker in the SAME basis, or the badge never clears — a UTC marker
+    # sits ~5.5h "behind" IST-naive timestamps, so just-read messages still
+    # count as unread.
     since = user.get("chatLastReadAt")
     if since is None:
-        since = datetime(1970, 1, 1, tzinfo=timezone.utc)
-    elif since.tzinfo is None:
-        since = since.replace(tzinfo=timezone.utc)
+        since = datetime(1970, 1, 1)  # naive; before any message
+    elif since.tzinfo is not None:
+        # Legacy value stored UTC-aware → convert to IST wall-clock naive.
+        since = since.astimezone(IST).replace(tzinfo=None)
 
     # Office (company-wide) + the user's team channels.
     channel_clause: list[dict] = [{"channelType": "office"}]
@@ -306,6 +312,8 @@ async def mark_chat_read(user_id: str = Depends(get_current_user)):
     """Called when the user opens a team chat — clears the unread badge."""
     await db.users.update_one(
         {"_id": ObjectId(user_id)},
-        {"$set": {"chatLastReadAt": datetime.now(timezone.utc)}},
+        # Stamp in IST wall-clock (naive) to match chat_messages.createdAt, so
+        # the unread count clears correctly right after reading.
+        {"$set": {"chatLastReadAt": now_ist_naive()}},
     )
     return {"ok": True}

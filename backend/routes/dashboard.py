@@ -508,11 +508,46 @@ async def my_dashboard(
     today = _today_str()
     year = now_ist_naive().year
 
-    # Today's attendance
-    today_att = await db.attendance.find_one({
-        "userId": user_id,
-        "date": today,
-    })
+    # These queries are all independent, so run them concurrently instead of
+    # one-after-another — this section was the dashboard's main latency (each
+    # sequential round-trip to the DB added up).
+    import asyncio
+
+    (
+        today_att,
+        balances_raw,
+        open_tasks_count,
+        recent_tasks_raw,
+        pending_leave,
+        pending_correction,
+        recent_payslips_raw,
+        unread_notifications,
+    ) = await asyncio.gather(
+        db.attendance.find_one({"userId": user_id, "date": today}),
+        db.leave_balances.find(
+            {"userId": user_id, "year": year}
+        ).to_list(length=100),
+        db.tasks.count_documents({
+            "assigneeId": user_id,
+            "status": {"$in": ["PENDING", "ONGOING"]},
+        }),
+        db.tasks.find({
+            "assigneeId": user_id,
+            "status": {"$in": ["PENDING", "ONGOING"]},
+        }).sort("createdAt", -1).limit(5).to_list(length=5),
+        db.leave_requests.count_documents({
+            "userId": user_id, "status": "PENDING",
+        }),
+        db.correction_requests.count_documents({
+            "userId": user_id, "status": "PENDING",
+        }),
+        db.payslips.find(
+            {"userId": user_id}
+        ).sort([("year", -1), ("month", -1)]).limit(3).to_list(length=3),
+        db.notifications.count_documents({
+            "userId": user_id, "read": False,
+        }),
+    )
 
     if today_att:
         today_summary = {
@@ -532,158 +567,128 @@ async def my_dashboard(
     else:
         today_summary = None
 
-    # Leave balances summary
-    balances: list[dict] = []
-    async for b in db.leave_balances.find({
-        "userId": user_id,
-        "year": year,
-    }):
-        allocated = float(b.get("allocated", 0))
-        used = float(b.get("used", 0))
-        pending = float(b.get("pending", 0))
-        balances.append({
+    balances = [
+        {
             "code": b.get("leaveTypeCode"),
-            "allocated": allocated,
-            "used": used,
-            "pending": pending,
-            "remaining": round(allocated - used - pending, 2),
-        })
+            "allocated": float(b.get("allocated", 0)),
+            "used": float(b.get("used", 0)),
+            "pending": float(b.get("pending", 0)),
+            "remaining": round(
+                float(b.get("allocated", 0))
+                - float(b.get("used", 0))
+                - float(b.get("pending", 0)),
+                2,
+            ),
+        }
+        for b in balances_raw
+    ]
 
-    # Open tasks assigned to me
-    open_tasks_count = await db.tasks.count_documents({
-        "assigneeId": user_id,
-        "status": {"$in": ["PENDING", "ONGOING"]},
-    })
-    recent_tasks: list[dict] = []
-    async for t in db.tasks.find({
-        "assigneeId": user_id,
-        "status": {"$in": ["PENDING", "ONGOING"]},
-    }).sort("createdAt", -1).limit(5):
-        recent_tasks.append({
+    recent_tasks = [
+        {
             "id": str(t["_id"]),
             "title": t.get("title"),
             "status": t.get("status"),
             "priority": t.get("priority", "MEDIUM"),
             "dueDate": t.get("dueDate"),
-        })
+        }
+        for t in recent_tasks_raw
+    ]
 
-    # My pending requests
-    pending_leave = await db.leave_requests.count_documents({
-        "userId": user_id,
-        "status": "PENDING",
-    })
-    pending_correction = await db.correction_requests.count_documents({
-        "userId": user_id,
-        "status": "PENDING",
-    })
-
-    # Recent payslips (latest 3)
-    recent_payslips: list[dict] = []
-    async for p in db.payslips.find({
-        "userId": user_id,
-    }).sort([("year", -1), ("month", -1)]).limit(3):
-        recent_payslips.append({
+    recent_payslips = [
+        {
             "year": p.get("year"),
             "month": p.get("month"),
             "netPay": p.get("netPay"),
             "status": p.get("status"),
-        })
+        }
+        for p in recent_payslips_raw
+    ]
 
-    # Unread in-app notifications
-    unread_notifications = await db.notifications.count_documents({
-        "userId": user_id,
-        "read": False,
-    })
-
-    # ===== KPIs =====
-
+    # ===== KPIs (parallelized) =====
     month_start = now_ist_naive().replace(day=1).strftime("%Y-%m-%d")
+    week_start = (
+        now_ist_naive() - timedelta(days=now_ist_naive().weekday())
+    ).strftime("%Y-%m-%d")
+    thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
 
-    # Personal attendance rate MTD. Denominator = elapsed working days this
-    # month (weekdays minus holidays); numerator = present-equivalent days
-    # (HALF_DAY = 0.5). Counting working days rather than existing rows means
-    # days with no attendance row register as absent instead of dropping out
-    # and pinning the rate at 100%.
+    # working_days feeds the present-days calc, so it's computed first; the
+    # rest of the KPI queries are independent and run concurrently.
     working_days = await _working_days_in_range(month_start, today)
-    my_mtd_present = await _present_working_days(
-        [user_id], month_start, today, working_days
+
+    (
+        my_mtd_present,
+        my_mtd_checkins,
+        my_mtd_ontime,
+        week_hours_rows,
+        month_rows,
+        total_my_30d,
+        completed_my_30d,
+        pending_reimb_me,
+    ) = await asyncio.gather(
+        _present_working_days([user_id], month_start, today, working_days),
+        db.attendance.count_documents({
+            "userId": user_id,
+            "date": {"$gte": month_start, "$lte": today},
+            "checkIn": {"$ne": None},
+        }),
+        db.attendance.count_documents({
+            "userId": user_id,
+            "date": {"$gte": month_start, "$lte": today},
+            "checkIn": {"$ne": None},
+            "isLate": {"$ne": True},
+        }),
+        db.attendance.find({
+            "userId": user_id,
+            "date": {"$gte": week_start, "$lte": today},
+            "hoursWorked": {"$gt": 0},
+        }).to_list(length=None),
+        db.attendance.find({
+            "userId": user_id,
+            "date": {"$gte": month_start, "$lte": today},
+        }).to_list(length=None),
+        db.tasks.count_documents({
+            "assigneeId": user_id,
+            "createdAt": {"$gte": thirty_days_ago},
+        }),
+        db.tasks.count_documents({
+            "assigneeId": user_id,
+            "createdAt": {"$gte": thirty_days_ago},
+            "status": "COMPLETED",
+        }),
+        db.reimbursement_requests.count_documents({
+            "userId": user_id,
+            "status": {"$in": ["PENDING_MANAGER", "PENDING_HR"]},
+        }),
     )
+
+    # Personal attendance rate MTD (present working days / elapsed working days).
     attendance_rate_pct = (
         round((my_mtd_present / len(working_days)) * 100, 1)
         if working_days else None
     )
-
-    # On-time check-in rate MTD — only rows where I actually checked in.
-    my_mtd_checkins = await db.attendance.count_documents({
-        "userId": user_id,
-        "date": {"$gte": month_start, "$lte": today},
-        "checkIn": {"$ne": None},
-    })
-    my_mtd_ontime = await db.attendance.count_documents({
-        "userId": user_id,
-        "date": {"$gte": month_start, "$lte": today},
-        "checkIn": {"$ne": None},
-        "isLate": {"$ne": True},
-    })
+    # On-time check-in rate MTD.
     on_time_checkin_pct = (
         round((my_mtd_ontime / my_mtd_checkins) * 100, 1)
         if my_mtd_checkins > 0 else None
     )
-
-    # Avg hours/day this week — queried over its own week range, not the
-    # month range. The current week can start in the previous month (the
-    # first few days of a new month), so scoping to month_start would drop
-    # those earlier week-days and understate the average.
-    week_start = (
-        now_ist_naive() - timedelta(days=now_ist_naive().weekday())
-    ).strftime("%Y-%m-%d")
-    total_hours_week = 0.0
-    counted_days = 0
-    async for r in db.attendance.find({
-        "userId": user_id,
-        "date": {"$gte": week_start, "$lte": today},
-        "hoursWorked": {"$gt": 0},
-    }):
-        total_hours_week += float(r.get("hoursWorked", 0))
-        counted_days += 1
+    # Avg hours/day this week (over the week range, which may cross a month).
+    counted_days = len(week_hours_rows)
+    total_hours_week = sum(
+        float(r.get("hoursWorked", 0)) for r in week_hours_rows
+    )
     avg_hours_week = (
         round(total_hours_week / counted_days, 2)
         if counted_days > 0 else None
     )
-
-    # Overtime this month — accumulated over the month range.
-    overtime_month = 0.0
-    async for r in db.attendance.find({
-        "userId": user_id,
-        "date": {"$gte": month_start, "$lte": today},
-    }):
-        overtime_month += float(r.get("overtimeHours", 0) or 0)
-
-    # Task completion rate (rolling 30d). Numerator and denominator must
-    # cover the SAME population — tasks created in the window — otherwise a
-    # task created earlier but completed recently inflates the rate past
-    # 100%. So we ask: of tasks created in the last 30d, how many are done.
-    thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
-    total_my_30d = await db.tasks.count_documents({
-        "assigneeId": user_id,
-        "createdAt": {"$gte": thirty_days_ago},
-    })
-    completed_my_30d = await db.tasks.count_documents({
-        "assigneeId": user_id,
-        "createdAt": {"$gte": thirty_days_ago},
-        "status": "COMPLETED",
-    })
+    # Overtime accumulated this month.
+    overtime_month = sum(
+        float(r.get("overtimeHours", 0) or 0) for r in month_rows
+    )
+    # Task completion rate (rolling 30d) over tasks CREATED in the window.
     task_completion_rate_pct = (
         round((completed_my_30d / total_my_30d) * 100, 1)
         if total_my_30d > 0 else None
     )
-
-    # Pending requests — per type so the tiles can each show their own
-    # badge — and total for the KPI strip.
-    pending_reimb_me = await db.reimbursement_requests.count_documents({
-        "userId": user_id,
-        "status": {"$in": ["PENDING_MANAGER", "PENDING_HR"]},
-    })
     pending_requests_total = pending_leave + pending_correction + pending_reimb_me
 
     # Required document upload completeness — counts the user's

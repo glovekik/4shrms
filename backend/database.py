@@ -359,3 +359,18 @@ async def create_indexes():
         unique=True,
         sparse=True,
     )
+    # ---- ID cards -------------------------------------------------------
+    # The collection had NO indexes: every /id-card/me and every HR review
+    # was a full scan. One card per employee, so the userId lookup is unique.
+    await db.id_cards.create_index("userId", unique=True)
+    # HR's approval queue filters by status and sorts by submission time.
+    await db.id_cards.create_index([("status", 1), ("submittedAt", -1)])
+
+    # ---- Leave overlap ---------------------------------------------------
+    # The timesheet asks "is this employee on approved leave during this
+    # week?" — userId + status + a date range. The existing
+    # (userId, fromDate, toDate) index can't use status, so approved-leave
+    # lookups scanned every leave row the person ever filed.
+    await db.leave_requests.create_index(
+        [("userId", 1), ("status", 1), ("fromDate", 1), ("toDate", 1)]
+    )

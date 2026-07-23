@@ -2,6 +2,7 @@ import os
 from datetime import datetime, timedelta, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.schedulers.base import SchedulerNotRunningError
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
@@ -784,6 +785,132 @@ def _acquire_singleton_lock() -> bool:
     return True
 
 
+# ================= WEEKLY NOTIFICATION CLEANUP =================
+NOTIFICATION_RETENTION_DAYS = 7
+
+
+# ================= TIMESHEET REMINDERS =================
+
+def _last_monday_str() -> str:
+    """Monday of the week that just ended (the week people must submit)."""
+    today = now_ist_naive().date()
+    this_monday = today - timedelta(days=today.weekday())
+    return (this_monday - timedelta(days=7)).strftime("%Y-%m-%d")
+
+
+async def weekly_timesheet_reminder() -> None:
+    """Monday morning: nudge anyone who hasn't submitted last week.
+
+    Deliberately also nudges REJECTED weeks — a rejected timesheet is still
+    an outstanding obligation, and it's the case most likely to be forgotten
+    because the employee already "did it once".
+
+    Skips anyone with no reporting manager: they can't submit at all (nobody
+    could approve it), so pinging them weekly would be noise they can't act
+    on. Those show up in the manager nudge below instead.
+    """
+    from utils.notify import notify_user
+
+    week_start = _last_monday_str()
+
+    submitted: set[str] = set()
+    async for t in db.timesheets.find(
+        {"weekStart": week_start, "status": {"$ne": "REJECTED"}},
+        {"userId": 1},
+    ):
+        if t.get("userId"):
+            submitted.add(t["userId"])
+
+    sent = 0
+    skipped_no_manager = 0
+    async for u in db.users.find(
+        {"status": {"$in": ["Active", None]}},
+        {"_id": 1, "reportingManagerId": 1},
+    ):
+        uid = str(u["_id"])
+        if uid in submitted:
+            continue
+        if not u.get("reportingManagerId"):
+            skipped_no_manager += 1
+            continue
+        await notify_user(
+            uid,
+            "timesheet_reminder",
+            "Submit last week's timesheet",
+            f"Week of {week_start} is still open. Fill in your in-time, "
+            "out-time and work notes, then send it to your manager.",
+            {"weekStart": week_start},
+        )
+        sent += 1
+
+    print(
+        f"[scheduler] weekly_timesheet_reminder: week {week_start} — "
+        f"{sent} reminded, {skipped_no_manager} skipped (no manager)"
+    )
+
+
+async def manager_pending_timesheet_nudge() -> None:
+    """Tell each manager how many timesheets are waiting on them.
+
+    One notification per manager with a count, not one per timesheet — a
+    manager with eight reports should not get eight pushes.
+    """
+    from bson import ObjectId
+    from utils.notify import notify_user
+
+    pending: dict[str, int] = {}
+    async for t in db.timesheets.find(
+        {"status": "PENDING"}, {"approverId": 1, "userId": 1},
+    ):
+        approver = t.get("approverId")
+        if not approver:
+            # Submitted before approverId was recorded — fall back to the
+            # employee's current reporting manager.
+            try:
+                emp = await db.users.find_one(
+                    {"_id": ObjectId(t["userId"])},
+                    {"reportingManagerId": 1},
+                )
+            except Exception:
+                emp = None
+            approver = (emp or {}).get("reportingManagerId")
+        if approver:
+            pending[approver] = pending.get(approver, 0) + 1
+
+    for manager_id, count in pending.items():
+        await notify_user(
+            manager_id,
+            "timesheet_pending",
+            "Timesheets waiting for you",
+            f"{count} timesheet{'s' if count != 1 else ''} "
+            f"{'are' if count != 1 else 'is'} waiting for your approval. "
+            "Approving updates the team's attendance for that week.",
+            {"count": count},
+        )
+
+    print(
+        "[scheduler] manager_pending_timesheet_nudge: notified "
+        f"{len(pending)} manager(s)"
+    )
+
+
+async def delete_old_notifications() -> None:
+    """Weekly purge of in-app (bell) notifications older than 7 days so the
+    feed stays lean. A 60-day TTL exists for newer rows, but this enforces a
+    tighter weekly retention and also clears legacy rows that predate the TTL
+    (they lack `expiresAt` and would otherwise live forever)."""
+    cutoff = now_ist_naive() - timedelta(days=NOTIFICATION_RETENTION_DAYS)
+    try:
+        res = await db.notifications.delete_many({"createdAt": {"$lt": cutoff}})
+        print(
+            f"[scheduler] delete_old_notifications: removed "
+            f"{res.deleted_count} notifications older than "
+            f"{NOTIFICATION_RETENTION_DAYS}d"
+        )
+    except Exception as e:  # pragma: no cover - best effort cleanup
+        print(f"[scheduler] delete_old_notifications failed: {e}")
+
+
 def start_scheduler() -> None:
     # Local/dev kill-switch: set DISABLE_SCHEDULER=1 to run the API without any
     # cron jobs (auto-close, reminders, emails, accrual). Prevents a local run
@@ -864,6 +991,30 @@ def start_scheduler() -> None:
         replace_existing=True,
     )
 
+    # Weekly (Sun 03:00 IST): purge in-app notifications older than 7 days.
+    scheduler.add_job(
+        delete_old_notifications,
+        CronTrigger(day_of_week="sun", hour=3, minute=0, timezone=_TZ),
+        id="delete_old_notifications",
+        replace_existing=True,
+    )
+
+    # Mon 10:00 IST: tell everyone to submit last week's timesheet.
+    scheduler.add_job(
+        weekly_timesheet_reminder,
+        CronTrigger(day_of_week="mon", hour=10, minute=0, timezone=_TZ),
+        id="weekly_timesheet_reminder",
+        replace_existing=True,
+    )
+
+    # Mon + Wed 16:00 IST: nudge managers sitting on pending timesheets.
+    scheduler.add_job(
+        manager_pending_timesheet_nudge,
+        CronTrigger(day_of_week="mon,wed", hour=16, minute=0, timezone=_TZ),
+        id="manager_pending_timesheet_nudge",
+        replace_existing=True,
+    )
+
     scheduler.start()
 
     print("[scheduler] started — jobs:", [
@@ -872,4 +1023,17 @@ def start_scheduler() -> None:
 
 
 def stop_scheduler() -> None:
-    scheduler.shutdown(wait=False)
+    """Shut the scheduler down, tolerating the case where it never started.
+
+    With DISABLE_SCHEDULER set, start_scheduler() returns before calling
+    scheduler.start(), so shutdown() raises SchedulerNotRunningError. That
+    exception propagated out of the FastAPI shutdown handler and turned every
+    clean stop into "Application shutdown failed. Exiting." — noisy, and it
+    masks any real shutdown error underneath it.
+    """
+    if not scheduler.running:
+        return
+    try:
+        scheduler.shutdown(wait=False)
+    except SchedulerNotRunningError:
+        pass

@@ -276,6 +276,10 @@ async def checkin(
         (data.clientAddress or "").strip()
         if attendance_type == "CLIENT" else None,
 
+        "clientName":
+        (data.clientName or "").strip()
+        if attendance_type == "CLIENT" else None,
+
         "createdAt":
         current_time,
 
@@ -489,6 +493,9 @@ async def get_today(
 
         "clientAddress":
         record.get("clientAddress"),
+
+        "clientName":
+        record.get("clientName"),
 
         "status":
         record.get(
@@ -867,16 +874,29 @@ async def manual_attendance(
             existing.get("status") if existing else "CHECKED_IN"
         )
 
+    final_notes = data.workNotes or (
+        existing.get("workNotes", "") if existing else ""
+    )
+
     set_fields = {
         "userId": user_id,
         "date": data.date,
         "attendanceType": data.attendanceType,
-        "workNotes": data.workNotes or (
-            existing.get("workNotes", "") if existing else ""
-        ),
+        "workNotes": final_notes,
         "status": status,
         "updatedAt": now,
     }
+
+    # HR/a manager can supply the times but usually can't say what the person
+    # actually did. Flag such a day so the employee's weekly timesheet can
+    # single it out and demand the work notes — a day with hours and no notes
+    # is exactly what the timesheet flow exists to close.
+    filled_for_someone_else = target_user_id != actor_id
+    set_fields["notesPendingFromEmployee"] = bool(
+        filled_for_someone_else
+        and not final_notes.strip()
+        and data.attendanceType not in ("LEAVE", "HOLIDAY")
+    )
     if parsed_in is not None:
         set_fields["checkIn"] = parsed_in
     if parsed_out is not None:
@@ -1158,6 +1178,7 @@ async def hr_list_attendance(
             "date": r.get("date"),
             "attendanceType": r.get("attendanceType"),
             "clientAddress": r.get("clientAddress"),
+            "clientName": r.get("clientName"),
             "status": r.get("status"),
             "isLate": r.get("isLate", False),
             "hoursWorked": r.get("hoursWorked", 0.0),

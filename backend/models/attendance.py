@@ -32,6 +32,7 @@ class AttendanceCheckIn(BaseModel):
     # A best-effort reverse-geocoded address, stored for CLIENT check-ins so
     # HR / managers can see where the person is working from.
     clientAddress: Optional[str] = None
+    clientName: Optional[str] = None
 
 
 class AttendanceCheckOut(BaseModel):
