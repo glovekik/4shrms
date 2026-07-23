@@ -12,9 +12,17 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Local secrets — Fly uses `fly secrets` instead.
+# Local secrets — env is injected on the host, never baked into the image.
+# The glob matters: `.env` alone missed `.env.bak`, which holds the Mongo
+# credentials and would have been copied in by the `COPY . .` below.
 .env
-.env.local
+.env.*
+
+# Google/Firebase service-account keys (these contain a private_key).
+sa.json
+*service-account*.json
+*serviceaccount*.json
+*-adminsdk-*.json
 
 # Logs and editor state.
 *.log
