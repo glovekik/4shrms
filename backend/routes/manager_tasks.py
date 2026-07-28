@@ -387,6 +387,11 @@ async def team_attendance(
             "date": r.get("date"),
             "attendanceType": r.get("attendanceType"),
             "clientAddress": r.get("clientAddress"),
+            "clientName": r.get("clientName"),
+            # Coordinates so the team view can open the exact client site on a
+            # map instead of routing to a separate client-visits screen.
+            "latitude": r.get("latitude"),
+            "longitude": r.get("longitude"),
             "status": r.get("status"),
             "isLate": r.get("isLate", False),
             "hoursWorked": r.get("hoursWorked", 0.0),

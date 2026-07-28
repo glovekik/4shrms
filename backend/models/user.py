@@ -1,4 +1,5 @@
 from pydantic import BaseModel, EmailStr
+from utils.email_norm import NormalizedEmail
 from typing import Optional, Literal
 
 
@@ -146,19 +147,19 @@ class ContractOverview(BaseModel):
 # ================= Auth models =================
 class UserCreate(BaseModel):
     name: str
-    email: EmailStr
+    email: NormalizedEmail
     password: str
 
 
 class UserLogin(BaseModel):
-    email: EmailStr
+    email: NormalizedEmail
     password: str
 
 
 # ================= HR-facing create/update =================
 class HRCreateUser(BaseModel):
     name: str
-    email: EmailStr
+    email: NormalizedEmail
     password: str  # initial password set by HR; user can change later
 
     # Identity / header

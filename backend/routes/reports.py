@@ -6,11 +6,14 @@ data as a spreadsheet without a second query path.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
+
+from io import BytesIO
 
 from bson import ObjectId
 from bson.errors import InvalidId
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date as _date
 from typing import Optional
 
 from database import db
@@ -20,6 +23,7 @@ from utils.dependencies import (
     require_hr_or_ceo,
     require_manager_or_hr,
 )
+from utils.work_report import build_work_xlsx, build_work_pdf
 
 router = APIRouter()       # /hr/reports/...
 manager_router = APIRouter()  # /manager/reports/...
@@ -329,3 +333,188 @@ async def team_productivity(
             "avgHoursPerDayLast7d": avg_per_day,
         })
     return out
+
+
+# ================= WORK REPORT (daily / weekly / monthly) =================
+# One detail row per employee per day — name, in/out, hours, work done —
+# for HR (whole company) and managers (direct reports). Downloadable as a
+# clean Excel or PDF.
+
+_DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+def _fmt_clock(dt) -> Optional[str]:
+    """A stored IST wall-clock datetime -> '9:15 AM'."""
+    if not dt:
+        return None
+    try:
+        return dt.strftime("%I:%M %p").lstrip("0")
+    except Exception:
+        return None
+
+
+async def _collect_work_rows(user_ids, from_date, to_date) -> list:
+    if not user_ids:
+        return []
+    oids = []
+    for x in user_ids:
+        try:
+            oids.append(ObjectId(x))
+        except (InvalidId, TypeError):
+            pass
+    users = {}
+    async for u in db.users.find({"_id": {"$in": oids}}):
+        users[str(u["_id"])] = u
+
+    q: dict = {"userId": {"$in": user_ids}}
+    dq = _date_range_query(from_date, to_date)
+    if dq:
+        q["date"] = dq
+
+    rows = []
+    async for r in db.attendance.find(q):
+        u = users.get(r.get("userId")) or {}
+        d = r.get("date") or ""
+        day = ""
+        try:
+            y, m, dd = (int(p) for p in d.split("-"))
+            day = _DOW[_date(y, m, dd).weekday()]
+        except Exception:
+            pass
+        rows.append({
+            "name": u.get("name") or "—",
+            "employeeCode": u.get("employeeCode") or "",
+            "date": d,
+            "day": day,
+            "checkIn": _fmt_clock(r.get("checkIn")),
+            "checkOut": _fmt_clock(r.get("checkOut")),
+            "hours": round(float(r.get("hoursWorked", 0) or 0), 2),
+            "type": r.get("attendanceType") or "",
+            "status": r.get("status") or "",
+            "workNotes": (r.get("workNotes") or "").strip(),
+        })
+    rows.sort(key=lambda x: ((x["name"] or "").lower(), x["date"]))
+    return rows
+
+
+def _report_meta(period, from_date, to_date, scope):
+    p = (period or "").strip().capitalize()
+    title = f"{p} Work Report" if p else "Work Report"
+    rng = from_date if from_date == to_date else f"{from_date} to {to_date}"
+    return title, f"{rng}  ·  {scope}"
+
+
+def _xlsx(data: bytes, from_date, to_date):
+    return StreamingResponse(
+        BytesIO(data),
+        media_type=("application/vnd.openxmlformats-officedocument"
+                    ".spreadsheetml.sheet"),
+        headers={"Content-Disposition":
+                 f'attachment; filename="work-report-{from_date}_{to_date}.xlsx"'},
+    )
+
+
+def _pdf(data: bytes, from_date, to_date):
+    return StreamingResponse(
+        BytesIO(data),
+        media_type="application/pdf",
+        headers={"Content-Disposition":
+                 f'attachment; filename="work-report-{from_date}_{to_date}.pdf"'},
+    )
+
+
+async def _hr_user_ids(department_id: Optional[str]) -> list:
+    uq: dict = {}
+    if department_id:
+        uq["departmentId"] = department_id
+    return [str(u["_id"]) async for u in db.users.find(uq, {"_id": 1})]
+
+
+async def _team_user_ids(manager_id: str) -> list:
+    return [
+        str(u["_id"])
+        async for u in db.users.find(
+            {"reportingManagerId": manager_id}, {"_id": 1}
+        )
+    ]
+
+
+# ---- HR (whole company) ----
+@router.get("/work")
+async def hr_work_report(
+    fromDate: str = Query(...),
+    toDate: str = Query(...),
+    departmentId: Optional[str] = Query(None),
+    _hr: dict = Depends(require_hr_or_ceo),
+):
+    uids = await _hr_user_ids(departmentId)
+    return await _collect_work_rows(uids, fromDate, toDate)
+
+
+@router.get("/work/export.xlsx")
+async def hr_work_xlsx(
+    fromDate: str = Query(...),
+    toDate: str = Query(...),
+    period: Optional[str] = Query(None),
+    departmentId: Optional[str] = Query(None),
+    _hr: dict = Depends(require_hr_or_ceo),
+):
+    rows = await _collect_work_rows(
+        await _hr_user_ids(departmentId), fromDate, toDate
+    )
+    title, sub = _report_meta(period, fromDate, toDate, "All employees")
+    return _xlsx(build_work_xlsx(rows, title, sub), fromDate, toDate)
+
+
+@router.get("/work/export.pdf")
+async def hr_work_pdf(
+    fromDate: str = Query(...),
+    toDate: str = Query(...),
+    period: Optional[str] = Query(None),
+    departmentId: Optional[str] = Query(None),
+    _hr: dict = Depends(require_hr_or_ceo),
+):
+    rows = await _collect_work_rows(
+        await _hr_user_ids(departmentId), fromDate, toDate
+    )
+    title, sub = _report_meta(period, fromDate, toDate, "All employees")
+    return _pdf(build_work_pdf(rows, title, sub), fromDate, toDate)
+
+
+# ---- Manager (direct reports) ----
+@manager_router.get("/work")
+async def mgr_work_report(
+    fromDate: str = Query(...),
+    toDate: str = Query(...),
+    actor: dict = Depends(require_manager_or_hr),
+):
+    uids = await _team_user_ids(str(actor["_id"]))
+    return await _collect_work_rows(uids, fromDate, toDate)
+
+
+@manager_router.get("/work/export.xlsx")
+async def mgr_work_xlsx(
+    fromDate: str = Query(...),
+    toDate: str = Query(...),
+    period: Optional[str] = Query(None),
+    actor: dict = Depends(require_manager_or_hr),
+):
+    rows = await _collect_work_rows(
+        await _team_user_ids(str(actor["_id"])), fromDate, toDate
+    )
+    title, sub = _report_meta(period, fromDate, toDate, "My team")
+    return _xlsx(build_work_xlsx(rows, title, sub), fromDate, toDate)
+
+
+@manager_router.get("/work/export.pdf")
+async def mgr_work_pdf(
+    fromDate: str = Query(...),
+    toDate: str = Query(...),
+    period: Optional[str] = Query(None),
+    actor: dict = Depends(require_manager_or_hr),
+):
+    rows = await _collect_work_rows(
+        await _team_user_ids(str(actor["_id"])), fromDate, toDate
+    )
+    title, sub = _report_meta(period, fromDate, toDate, "My team")
+    return _pdf(build_work_pdf(rows, title, sub), fromDate, toDate)

@@ -7,6 +7,7 @@ boundaries.
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, EmailStr
+from utils.email_norm import NormalizedEmail
 
 from bson import ObjectId
 from bson.errors import InvalidId
@@ -70,7 +71,7 @@ async def get_public_opening(id: str):
 # ================= CAREERS — APPLY =================
 class CareersApply(BaseModel):
     name: str
-    email: EmailStr
+    email: NormalizedEmail
     phone: Optional[str] = None
     resumeUrl: Optional[str] = None
     currentCompany: Optional[str] = None

@@ -40,9 +40,11 @@ COMPANY_NAME = os.getenv(
     "COMPANY_NAME",
     "ForesightAI Technologies Private Limited",
 )
-COMPANY_ADDRESS = os.getenv(
-    "COMPANY_ADDRESS",
-    "",
+# `or` (not a getenv default) so an env that sets COMPANY_ADDRESS to an empty
+# string still falls back to the real address instead of printing a blank line.
+COMPANY_ADDRESS = os.getenv("COMPANY_ADDRESS", "").strip() or (
+    "1-1-565/307, Golconda X Road, Bakaram, Musheerabad (ND), "
+    "Hyderabad - 500020, Telangana"
 )
 # Local path to a logo image (PNG/JPG). Defaults to the bundled brand logo
 # in backend/assets so payslips/letters carry the logo even without an env

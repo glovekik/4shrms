@@ -28,7 +28,7 @@ from utils.payroll_calc import (
     compute_lop_deduction,
     days_in_month,
 )
-from utils.pdf import build_payslip_pdf
+from utils.pdf import build_payslip_pdf, PAYSLIP_PDF_VERSION
 from utils.email import send_email_with_pdf
 from utils.push import push_to_users
 from utils.notify import create_notification
@@ -822,35 +822,73 @@ async def my_payslip(
 
 
 # ================= PDF GENERATION =================
+def _naive_utc(dt):
+    """Normalize a datetime to naive-UTC for a safe comparison."""
+    if dt is None:
+        return None
+    if getattr(dt, "tzinfo", None) is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
 async def _load_pdf_bytes(payslip: dict) -> bytes:
-    """Returns PDF bytes — from GridFS cache if present, else generates
-    and caches."""
-    file_id = payslip.get("pdfFileId")
+    """Returns PDF bytes — from the GridFS cache when it's still valid, else
+    regenerates and re-caches.
 
-    if file_id:
-        try:
-            stream = await _bucket().open_download_stream(
-                ObjectId(file_id)
-            )
-            data = await stream.read()
-            return data
-        except Exception:
-            # Cache row pointed at a missing GridFS file — fall through
-            # to regeneration.
-            pass
-
-    # Generate fresh.
+    A cached PDF is valid only if BOTH hold:
+      * it was produced by the current layout version, AND
+      * the employee's profile hasn't been edited since it was cached.
+    That second check is what makes an HR edit to the PF number / PAN / bank
+    show up on the very next download instead of serving a stale PDF."""
+    # Fetch the employee first — needed both to judge the cache and to generate.
     user_oid_str = payslip.get("userId")
     user = None
     try:
-        user = await db.users.find_one({
-            "_id": ObjectId(user_oid_str)
-        })
+        user = await db.users.find_one({"_id": ObjectId(user_oid_str)})
     except (InvalidId, TypeError):
         pass
+    user_dict = dict(user or {})
 
-    user_dict = user or {}
+    file_id = payslip.get("pdfFileId")
+    gen_at = _naive_utc(payslip.get("pdfGeneratedAt"))
+    user_at = _naive_utc(user_dict.get("updatedAt"))
+    profile_unchanged = not (gen_at and user_at and user_at > gen_at)
+    cache_ok = (
+        bool(file_id)
+        and payslip.get("pdfVersion") == PAYSLIP_PDF_VERSION
+        and profile_unchanged
+    )
+
+    if cache_ok:
+        try:
+            stream = await _bucket().open_download_stream(ObjectId(file_id))
+            return await stream.read()
+        except Exception:
+            # Cache row pointed at a missing GridFS file — regenerate.
+            pass
+
+    # Resolve the department NAME so the payslip can show it (the user only
+    # stores departmentId). Non-fatal — the line just shows "—" without it.
+    dept_id = user_dict.get("departmentId") or (
+        (user_dict.get("work") or {}).get("departmentId")
+    )
+    if dept_id:
+        try:
+            dept = await db.departments.find_one({"_id": ObjectId(dept_id)})
+            if dept:
+                user_dict["departmentName"] = dept.get("name")
+        except (InvalidId, TypeError):
+            pass
+
     pdf_bytes = build_payslip_pdf(payslip, user_dict)
+
+    # Drop any stale cached file before writing the new one, so GridFS doesn't
+    # accumulate orphans each time it regenerates.
+    if file_id:
+        try:
+            await _bucket().delete(ObjectId(file_id))
+        except Exception:
+            pass
 
     # Cache it.
     filename = (
@@ -870,7 +908,11 @@ async def _load_pdf_bytes(payslip: dict) -> bytes:
     )
     await db.payslips.update_one(
         {"_id": payslip["_id"]},
-        {"$set": {"pdfFileId": str(new_id)}},
+        {"$set": {
+            "pdfFileId": str(new_id),
+            "pdfVersion": PAYSLIP_PDF_VERSION,
+            "pdfGeneratedAt": datetime.now(timezone.utc),
+        }},
     )
 
     return pdf_bytes

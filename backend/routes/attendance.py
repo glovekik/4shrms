@@ -1179,6 +1179,9 @@ async def hr_list_attendance(
             "attendanceType": r.get("attendanceType"),
             "clientAddress": r.get("clientAddress"),
             "clientName": r.get("clientName"),
+            # Coordinates so HR can open the exact client site on a map.
+            "latitude": r.get("latitude"),
+            "longitude": r.get("longitude"),
             "status": r.get("status"),
             "isLate": r.get("isLate", False),
             "hoursWorked": r.get("hoursWorked", 0.0),

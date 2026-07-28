@@ -12,6 +12,9 @@ document per user in the `id_cards` collection, keyed by userId.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
+
+from io import BytesIO
 
 from bson import ObjectId
 from bson.errors import InvalidId
@@ -26,6 +29,38 @@ from utils.push import push_to_user
 from utils.audit import log_audit
 from models.id_card import IDCardPhotoSubmit, IDCardReject, IDCardFraming
 from utils.face_frame import auto_framing_for_url, DEFAULT_FRAMING
+from utils.id_card_render import build_info, render_id_card
+
+
+async def _dept_name(user: dict) -> Optional[str]:
+    """Resolve the employee's department name for the badge (stored as an id)."""
+    dept_id = user.get("departmentId") or (user.get("work") or {}).get(
+        "departmentId"
+    )
+    if dept_id:
+        try:
+            dept = await db.departments.find_one({"_id": ObjectId(dept_id)})
+            if dept:
+                return dept.get("name")
+        except (InvalidId, TypeError):
+            pass
+    return None
+
+
+def _badge_file(user: dict, card: dict, dept: Optional[str], fmt: str):
+    """Render + stream the badge as a downloadable JPG or PDF."""
+    fmt = "jpg" if str(fmt).lower() in ("jpg", "jpeg") else "pdf"
+    data = render_id_card(build_info(user, card, dept), fmt)
+    mime = "image/jpeg" if fmt == "jpg" else "application/pdf"
+    safe = (user.get("name") or "id-card").replace(" ", "_")
+    return StreamingResponse(
+        BytesIO(data),
+        media_type=mime,
+        headers={
+            "Content-Disposition":
+            f'attachment; filename="idcard-{safe}.{fmt}"'
+        },
+    )
 
 
 router = APIRouter()      # employee-facing, mounted at /id-card
@@ -50,6 +85,8 @@ def _serialize(doc: Optional[dict]) -> dict:
             "rejectionReason": None,
             "framing": {"zoom": 1.0, "offsetX": 0.0, "offsetY": 0.0},
             "autoFramed": False,
+            "approvedPhotoUrl": None,
+            "approvedFraming": None,
         }
     return {
         "status": doc.get("status", NONE),
@@ -61,6 +98,11 @@ def _serialize(doc: Optional[dict]) -> dict:
         "framing": doc.get("framing")
         or {"zoom": 1.0, "offsetX": 0.0, "offsetY": 0.0},
         "autoFramed": bool(doc.get("autoFramed")),
+        # The last photo/framing HR actually approved, snapshotted on approve
+        # and left untouched by a later re-upload. Lets the employee keep
+        # seeing their issued card while a NEW photo sits in PENDING/REJECTED.
+        "approvedPhotoUrl": doc.get("approvedPhotoUrl"),
+        "approvedFraming": doc.get("approvedFraming"),
     }
 
 
@@ -282,6 +324,12 @@ async def approve_id_card(user_id: str, hr: dict = Depends(require_hr)):
                 "reviewedAt": now_ist_naive(),
                 "reviewedBy": str(hr["_id"]),
                 "rejectionReason": None,
+                # Snapshot what was approved. A later re-upload overwrites
+                # photoUrl/status but leaves these, so the employee's issued
+                # card stays visible until the new photo is approved in turn.
+                "approvedPhotoUrl": doc.get("photoUrl"),
+                "approvedFraming": doc.get("framing")
+                or {"zoom": 1.0, "offsetX": 0.0, "offsetY": 0.0},
             }
         },
     )
@@ -368,3 +416,44 @@ async def get_user_id_card(user_id: str, hr: dict = Depends(require_hr)):
     item["userId"] = user_id
     item["user"] = await _user_brief(user_id)
     return item
+
+
+# ===================== DOWNLOAD (server-rendered PDF / JPG) =====================
+
+@router.get("/me/badge")
+async def download_my_badge(
+    format: str = Query("pdf", description="pdf | jpg"),
+    user_id: str = Depends(get_current_user),
+):
+    """Download the logged-in employee's issued ID card as a PDF or JPG.
+
+    Rendered on the server so the photo + logo are always embedded and the file
+    is a clean, print-ready badge (not a browser screenshot)."""
+    doc = await db.id_cards.find_one({"userId": user_id})
+    if not doc or not (
+        doc.get("status") == APPROVED or doc.get("approvedPhotoUrl")
+    ):
+        raise HTTPException(400, "Your ID card hasn't been approved yet.")
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    if not user:
+        raise HTTPException(404, "User not found")
+    return _badge_file(user, doc, await _dept_name(user), format)
+
+
+@hr_router.get("/id-cards/{user_id}/badge")
+async def download_user_badge(
+    user_id: str,
+    format: str = Query("pdf", description="pdf | jpg"),
+    hr: dict = Depends(require_hr),
+):
+    """HR downloads an employee's ID card as a PDF or JPG."""
+    doc = await db.id_cards.find_one({"userId": user_id})
+    if not doc:
+        raise HTTPException(404, "No ID card for this employee.")
+    try:
+        user = await db.users.find_one({"_id": ObjectId(user_id)})
+    except (InvalidId, TypeError):
+        user = None
+    if not user:
+        raise HTTPException(404, "User not found")
+    return _badge_file(user, doc, await _dept_name(user), format)

@@ -1226,17 +1226,41 @@ async def _scoped_query(
     status: Optional[str],
     user_id: Optional[str],
     week_start: Optional[str],
+    user_ids: Optional[str] = None,
 ) -> Optional[dict]:
-    """Mongo query for what this actor may see. None = nothing to show."""
+    """Mongo query for what this actor may see. None = nothing to show.
+
+    `user_ids` is an optional comma-separated list (download a chosen subset of
+    people); `user_id` is the single-person shortcut. Either is intersected with
+    what the actor is allowed to see.
+    """
     query: dict = {}
     if status:
         query["status"] = status.upper()
     if week_start:
         query["weekStart"] = week_start
 
+    requested: list[str] = []
+    if user_ids:
+        requested = [x.strip() for x in user_ids.split(",") if x.strip()]
+    elif user_id:
+        requested = [user_id]
+
+    def _apply(allowed: Optional[list[str]]):
+        # allowed=None means "no restriction" (HR). Return the userId clause.
+        picks = requested
+        if allowed is not None:
+            picks = [r for r in requested if r in allowed]
+            if requested and not picks:
+                raise HTTPException(403, "Not your direct reports")
+        if picks:
+            return picks[0] if len(picks) == 1 else {"$in": picks}
+        return {"$in": allowed} if allowed is not None else None
+
     if actor.get("role") == "HR":
-        if user_id:
-            query["userId"] = user_id
+        clause = _apply(None)
+        if clause is not None:
+            query["userId"] = clause
         return query
 
     actor_id = str(actor["_id"])
@@ -1248,12 +1272,7 @@ async def _scoped_query(
     ]
     if not report_ids:
         return None
-    if user_id:
-        if user_id not in report_ids:
-            raise HTTPException(403, "Not one of your direct reports")
-        query["userId"] = user_id
-    else:
-        query["userId"] = {"$in": report_ids}
+    query["userId"] = _apply(report_ids)
     return query
 
 
@@ -1508,11 +1527,12 @@ async def manager_timesheet_summary(
 async def manager_export_timesheets(
     status: Optional[str] = Query(None),
     userId: Optional[str] = Query(None),
+    userIds: Optional[str] = Query(None),
     weekStart: Optional[str] = Query(None),
     actor: dict = Depends(require_manager_or_hr),
 ):
     wb = await _timesheet_workbook(
-        await _scoped_query(actor, status, userId, weekStart)
+        await _scoped_query(actor, status, userId, weekStart, userIds)
     )
     return _xlsx(wb, f"timesheets{'-' + weekStart if weekStart else ''}.xlsx")
 
@@ -1533,11 +1553,12 @@ async def hr_timesheet_summary(
 async def hr_export_timesheets(
     status: Optional[str] = Query(None),
     userId: Optional[str] = Query(None),
+    userIds: Optional[str] = Query(None),
     weekStart: Optional[str] = Query(None),
     hr: dict = Depends(require_hr),
 ):
     wb = await _timesheet_workbook(
-        await _scoped_query(hr, status, userId, weekStart)
+        await _scoped_query(hr, status, userId, weekStart, userIds)
     )
     return _xlsx(wb, f"timesheets{'-' + weekStart if weekStart else ''}.xlsx")
 

@@ -1,4 +1,5 @@
 from pydantic import BaseModel, EmailStr
+from utils.email_norm import NormalizedEmail
 from typing import Optional, Literal
 
 
@@ -48,7 +49,7 @@ CandidateSource = Literal[
 
 class CandidateCreate(BaseModel):
     name: str
-    email: EmailStr
+    email: NormalizedEmail
     phone: Optional[str] = None
     jobOpeningId: Optional[str] = None
     resumeUrl: Optional[str] = None

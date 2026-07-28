@@ -5,6 +5,7 @@ from fastapi import (
 )
 
 from pydantic import BaseModel, EmailStr
+from utils.email_norm import NormalizedEmail
 
 from typing import Literal
 
@@ -57,14 +58,14 @@ class SignupModel(BaseModel):
 
     name: str
 
-    email: str
+    email: NormalizedEmail
 
     password: str
 
 
 class LoginModel(BaseModel):
 
-    email: str
+    email: NormalizedEmail
 
     password: str
 
@@ -305,7 +306,7 @@ async def login(
 
 # ================= OTP HELPERS + ENDPOINTS =================
 class VerifyOtpRequest(BaseModel):
-    email: EmailStr
+    email: NormalizedEmail
     otp: str
 
 
@@ -540,6 +541,22 @@ async def get_me(
         "profilePictureUrl":
         user.get("profilePictureUrl"),
 
+        # Org + nested profile. Included so the employee's OWN ID card renders
+        # the same back-of-card details HR sees (Department, Blood group,
+        # Emergency contact). Without these, /me was thinner than /hr/users/{id}
+        # and the employee's card showed "—" where HR's showed real values.
+        "departmentId":
+        user.get("departmentId"),
+
+        "work":
+        user.get("work") or {},
+
+        "personal":
+        user.get("personal") or {},
+
+        "emergencyContact":
+        user.get("emergencyContact") or {},
+
         "ledTeamIds":
         led_team_ids,
 
@@ -615,11 +632,11 @@ PASSWORD_RESET_RESEND_COOLDOWN_SECONDS = 60
 
 
 class ForgotPasswordRequest(BaseModel):
-    email: EmailStr
+    email: NormalizedEmail
 
 
 class VerifyResetCodeRequest(BaseModel):
-    email: EmailStr
+    email: NormalizedEmail
     code: str
 
 
