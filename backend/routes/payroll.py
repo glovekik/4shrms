@@ -502,21 +502,28 @@ async def process_payroll_run(
             skipped.append(user_id)
             continue
 
-        # Count paid days: any attendance row that ISN'T an ABSENT marker and
-        # isn't an HR-marked UNPAID leave. Present / late / half-day / paid-
-        # leave rows all count as paid; ABSENT-status rows (daily absent cron /
-        # correction placeholders) and unpaid-leave days must be excluded, or
-        # they'd be paid instead of docked as LOP.
-        attended = await db.attendance.count_documents({
+        # LOP = only the days the user was actually absent unpaid, NOT
+        # (expected - attended). The daily-absent cron marks weekday no-shows
+        # as ABSENT (it already skips weekends + public holidays), and HR-marked
+        # unpaid leave is flagged unpaid. Days with no attendance row at all —
+        # weekends, week-offs, un-logged days — are not absences and must never
+        # be docked. The old (effective_working_days - attended) formula counted
+        # every weekend as LOP, docking ~5 days/month from a full-attendance
+        # employee.
+        lop_days = await db.attendance.count_documents({
             "userId": user_id,
             "date": {"$gte": from_d, "$lte": to_d},
-            "status": {"$ne": "ABSENT"},
-            "unpaid": {"$ne": True},
+            "$or": [
+                {"status": "ABSENT"},
+                {"unpaid": True},
+            ],
         })
 
-        # LOP = days where user was *expected* to work but didn't show up.
-        # Holidays reduce the expected count, so they're never LOP.
-        lop_days = max(0, effective_working_days - attended)
+        # "Attended" (paid days) = workingDays minus unpaid absences. This
+        # intentionally counts Sundays / week-offs / public holidays as
+        # attended, since they are paid — so on screen attended + LOP always
+        # equals workingDays instead of leaving a phantom weekend gap.
+        attended = max(0, working_days - lop_days)
 
         resolved = resolve_structure_amounts(structure)
         totals_full = compute_totals(resolved)
@@ -735,15 +742,11 @@ async def override_payslip(
         if v is not None:
             update[field] = v
 
-    # If HR rewrote attendedDays/workingDays but not lopDays, derive lopDays
-    # from the new attendance so the LOP deduction below uses fresh numbers.
-    if (
-        ("workingDays" in update or "attendedDays" in update)
-        and "lopDays" not in update
-    ):
-        new_wd = update.get("workingDays", p.get("workingDays") or 0)
-        new_ad = update.get("attendedDays", p.get("attendedDays") or 0)
-        update["lopDays"] = max(0, (new_wd or 0) - (new_ad or 0))
+    # NOTE: lopDays is NOT auto-derived from (workingDays - attendedDays) — that
+    # counted weekends/week-offs as loss of pay. LOP is driven by actual ABSENT
+    # / unpaid days (set during processing). If HR wants to change the LOP here,
+    # they edit the lopDays field directly; editing workingDays/attendedDays
+    # alone leaves the already-correct lopDays untouched.
 
     # Build the post-override slip in memory to recompute totals.
     merged = {**p, **update}

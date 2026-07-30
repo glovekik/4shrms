@@ -382,6 +382,7 @@ async def _collect_work_rows(user_ids, from_date, to_date) -> list:
         except Exception:
             pass
         rows.append({
+            "userId": r.get("userId"),
             "name": u.get("name") or "—",
             "employeeCode": u.get("employeeCode") or "",
             "date": d,
@@ -439,6 +440,16 @@ async def _team_user_ids(manager_id: str) -> list:
     ]
 
 
+def _pick_ids(allowed: list, user_ids: Optional[str]) -> list:
+    """Intersect an explicit userIds filter (comma-separated) with the caller's
+    allowed set, so HR/managers can export a chosen subset of people without
+    escaping their scope. Blank/None -> every allowed user."""
+    if not user_ids:
+        return allowed
+    want = {x.strip() for x in user_ids.split(",") if x.strip()}
+    return [u for u in allowed if u in want]
+
+
 # ---- HR (whole company) ----
 @router.get("/work")
 async def hr_work_report(
@@ -457,10 +468,11 @@ async def hr_work_xlsx(
     toDate: str = Query(...),
     period: Optional[str] = Query(None),
     departmentId: Optional[str] = Query(None),
+    userIds: Optional[str] = Query(None),
     _hr: dict = Depends(require_hr_or_ceo),
 ):
     rows = await _collect_work_rows(
-        await _hr_user_ids(departmentId), fromDate, toDate
+        _pick_ids(await _hr_user_ids(departmentId), userIds), fromDate, toDate
     )
     title, sub = _report_meta(period, fromDate, toDate, "All employees")
     return _xlsx(build_work_xlsx(rows, title, sub), fromDate, toDate)
@@ -472,10 +484,11 @@ async def hr_work_pdf(
     toDate: str = Query(...),
     period: Optional[str] = Query(None),
     departmentId: Optional[str] = Query(None),
+    userIds: Optional[str] = Query(None),
     _hr: dict = Depends(require_hr_or_ceo),
 ):
     rows = await _collect_work_rows(
-        await _hr_user_ids(departmentId), fromDate, toDate
+        _pick_ids(await _hr_user_ids(departmentId), userIds), fromDate, toDate
     )
     title, sub = _report_meta(period, fromDate, toDate, "All employees")
     return _pdf(build_work_pdf(rows, title, sub), fromDate, toDate)
@@ -497,10 +510,12 @@ async def mgr_work_xlsx(
     fromDate: str = Query(...),
     toDate: str = Query(...),
     period: Optional[str] = Query(None),
+    userIds: Optional[str] = Query(None),
     actor: dict = Depends(require_manager_or_hr),
 ):
     rows = await _collect_work_rows(
-        await _team_user_ids(str(actor["_id"])), fromDate, toDate
+        _pick_ids(await _team_user_ids(str(actor["_id"])), userIds),
+        fromDate, toDate
     )
     title, sub = _report_meta(period, fromDate, toDate, "My team")
     return _xlsx(build_work_xlsx(rows, title, sub), fromDate, toDate)
@@ -511,10 +526,12 @@ async def mgr_work_pdf(
     fromDate: str = Query(...),
     toDate: str = Query(...),
     period: Optional[str] = Query(None),
+    userIds: Optional[str] = Query(None),
     actor: dict = Depends(require_manager_or_hr),
 ):
     rows = await _collect_work_rows(
-        await _team_user_ids(str(actor["_id"])), fromDate, toDate
+        _pick_ids(await _team_user_ids(str(actor["_id"])), userIds),
+        fromDate, toDate
     )
     title, sub = _report_meta(period, fromDate, toDate, "My team")
     return _pdf(build_work_pdf(rows, title, sub), fromDate, toDate)
