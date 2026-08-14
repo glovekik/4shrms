@@ -521,6 +521,15 @@ async def get_today(
             ""
         ),
 
+        "halfDay":
+        record.get("halfDay", False),
+
+        "halfDayPart":
+        record.get("halfDayPart"),
+
+        "unpaid":
+        record.get("unpaid", False),
+
         "autoClosedByCron":
         record.get(
             "autoClosedByCron",
@@ -591,6 +600,15 @@ async def get_history(
                 "workNotes",
                 ""
             ),
+
+            "halfDay":
+            item.get("halfDay", False),
+
+            "halfDayPart":
+            item.get("halfDayPart"),
+
+            "unpaid":
+            item.get("unpaid", False),
 
             "autoClosedByCron":
             item.get(
@@ -1191,6 +1209,7 @@ async def hr_list_attendance(
             "checkOut": iso_naive(r.get("checkOut")),
             "workNotes": r.get("workNotes", ""),
             "unpaid": bool(r.get("unpaid", False)),
+            "unpaidReason": r.get("unpaidReason"),
         })
 
     return out
@@ -1207,13 +1226,18 @@ async def hr_mark_unpaid_leave(
     excludes it from `attended` and it becomes Loss-of-Pay. Paid leave, by
     contrast, is what an employee requests against their leave balance.
 
-    Body: { userId: str, date: "YYYY-MM-DD", unpaid: bool }
+    Body: { userId: str, date: "YYYY-MM-DD", unpaid: bool, reason?: str }
       unpaid=true  → upsert an unpaid LEAVE row for that day
       unpaid=false → remove the unpaid-leave marker (deletes the row)
+
+    `reason` is optional and free-text. It is kept in its own field (rather
+    than only inside workNotes) so it survives note edits and can be shown
+    back to HR when they revisit the day.
     """
     user_id = (body.get("userId") or "").strip()
     date_str = (body.get("date") or "").strip()
     make_unpaid = bool(body.get("unpaid", True))
+    reason = (body.get("reason") or "").strip()[:300]
 
     if not user_id or not date_str:
         raise HTTPException(400, "userId and date are required")
@@ -1250,7 +1274,12 @@ async def hr_mark_unpaid_leave(
                 "checkOut": None,
                 "hoursWorked": 0.0,
                 "isLate": False,
-                "workNotes": "Unpaid leave (marked by HR)",
+                "workNotes": (
+                    f"Unpaid leave (marked by HR) — {reason}"
+                    if reason
+                    else "Unpaid leave (marked by HR)"
+                ),
+                "unpaidReason": reason or None,
                 "markedUnpaidBy": str(hr["_id"]),
                 "autoClosedByCron": False,
                 "updatedAt": now,

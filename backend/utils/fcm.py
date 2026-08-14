@@ -83,6 +83,8 @@ async def send_fcm(
     data: Optional[dict] = None,
     channel_id: Optional[str] = None,
     sound: str = "default",
+    collapse_key: Optional[str] = None,
+    data_only: bool = False,
 ) -> list[str]:
     """Send a notification to native FCM tokens via HTTP v1.
 
@@ -107,6 +109,21 @@ async def send_fcm(
         notif["channel_id"] = channel_id
     if sound:
         notif["sound"] = sound
+    if data_only:
+        # Data-only messages are deferrable by default; without this Android
+        # can sit on them in Doze and the card never appears.
+        android["priority"] = "high"
+        # The client draws the card, so channel/sound/tag are its call — an
+        # android.notification block here would be ignored at best and fight
+        # notifee's own ids at worst.
+        notif = {}
+    if collapse_key:
+        # collapse_key still matters: it dedupes messages queued at FCM while
+        # the device is offline. `tag` only applies to server-drawn cards.
+        android["collapse_key"] = collapse_key
+        if not data_only:
+            # Replaces the showing card instead of stacking a new one.
+            notif["tag"] = collapse_key
     if notif:
         android["notification"] = notif
 
@@ -114,14 +131,24 @@ async def send_fcm(
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             for tok in tokens:
-                message = {
-                    "message": {
-                        "token": tok,
-                        "notification": {"title": title, "body": body},
-                        "data": str_data,
-                        "android": android,
-                    }
+                # A `notification` block makes Android draw the card itself —
+                # one per message, with no way to merge them. Omitting it
+                # hands the payload to the app's background handler, which
+                # builds a single MessagingStyle card per conversation.
+                # Title/body still ride along in data as a fallback for any
+                # client that can't render it.
+                payload: dict = {
+                    "token": tok,
+                    "data": (
+                        {**str_data, "title": title, "body": str(body)}
+                        if data_only
+                        else str_data
+                    ),
+                    "android": android,
                 }
+                if not data_only:
+                    payload["notification"] = {"title": title, "body": body}
+                message = {"message": payload}
                 try:
                     r = await client.post(url, headers=headers, json=message)
                     if r.status_code >= 400:

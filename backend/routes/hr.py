@@ -24,7 +24,7 @@ from utils.dependencies import require_hr, require_hr_or_ceo
 from utils.email import send_notification_email
 from utils.audit import log_audit
 from utils.notify import notify_user
-from models.user import HRCreateUser, HRUserUpdate
+from models.user import HRCreateUser, HRSetPassword, HRUserUpdate
 from models.team import TeamCreate, TeamUpdate
 
 router = APIRouter()
@@ -611,6 +611,61 @@ async def update_user(
     )
 
     return {"message": "User updated"}
+
+
+# ================= HR: SET A USER'S PASSWORD DIRECTLY =================
+@router.post("/users/{id}/set-password")
+async def hr_set_user_password(
+    id: str,
+    data: HRSetPassword,
+    hr: dict = Depends(require_hr),
+):
+    """Set a user's password without the email round-trip.
+
+    The rescue path for when reset-link email isn't being delivered — the
+    setup-link flow in send_password_setup_link is still the preferred
+    route, since it never puts a plaintext password on the wire twice.
+
+    Any outstanding reset tokens are burned: leaving them live would let an
+    old emailed link silently undo the password HR just set.
+    """
+    try:
+        oid = ObjectId(id)
+    except (InvalidId, TypeError):
+        raise HTTPException(400, "Invalid id")
+
+    user = await db.users.find_one({"_id": oid})
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    pw = (data.password or "").strip()
+    if len(pw) < 6:
+        raise HTTPException(
+            400, "Password must be at least 6 characters"
+        )
+
+    await db.users.update_one(
+        {"_id": oid},
+        {
+            "$set": {
+                "password": pwd_context.hash(pw),
+                "updatedAt": now_ist_naive(),
+            }
+        },
+    )
+
+    await db.password_reset_tokens.delete_many({"userId": str(oid)})
+
+    # Never log the password itself — only that it was replaced, by whom.
+    await log_audit(
+        actor_id=str(hr["_id"]),
+        action="user.password.set",
+        entity_type="users",
+        entity_id=id,
+        after={"by": "hr_direct"},
+    )
+
+    return {"message": "Password updated"}
 
 
 # ================= TEAMS =================

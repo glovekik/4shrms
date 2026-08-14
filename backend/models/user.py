@@ -190,6 +190,16 @@ class HRCreateUser(BaseModel):
     initialAssetIds: Optional[list[str]] = None
 
 
+class HRSetPassword(BaseModel):
+    """HR setting a user's password directly (POST /hr/users/{id}/set-password).
+
+    Deliberately separate from HRUserUpdate: password changes are audited
+    and burn outstanding reset tokens, so they must not ride along on a
+    general profile PUT.
+    """
+    password: str
+
+
 class HRUserUpdate(BaseModel):
     """Partial update — only fields HR is allowed to change.
 

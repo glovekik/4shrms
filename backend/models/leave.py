@@ -41,6 +41,10 @@ class LeaveRequestCreate(BaseModel):
 class LeaveDecision(BaseModel):
     action: Literal["APPROVE", "REJECT"]
     note: Optional[str] = ""
+    # Approve as loss-of-pay: the days are granted but not charged to the
+    # paid balance (there is none left, or the type doesn't carry one).
+    # Payroll keys off this to deduct salary for the days.
+    unpaid: bool = False
 
 
 # ================= HR LEAVE BALANCE UPSERT =================

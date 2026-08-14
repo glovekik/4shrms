@@ -69,7 +69,17 @@ async def _decide_leave_internal(
     year = _parse_date(req["fromDate"], "fromDate").year
     total_days = req.get("totalDays", 0)
 
+    unpaid = bool(getattr(data, "unpaid", False))
+
     if data.action == "APPROVE":
+        # Loss-of-pay days are still released from `pending` (the request is
+        # no longer outstanding) but never land in `used` — charging the paid
+        # balance is exactly what "unpaid" means we must not do.
+        balance_inc = (
+            {"pending": -total_days}
+            if unpaid
+            else {"pending": -total_days, "used": total_days}
+        )
         await db.leave_balances.update_one(
             {
                 "userId": req["userId"],
@@ -77,10 +87,7 @@ async def _decide_leave_internal(
                 "year": year,
             },
             {
-                "$inc": {
-                    "pending": -total_days,
-                    "used": total_days,
-                },
+                "$inc": balance_inc,
                 "$set": {"updatedAt": now},
             },
         )
@@ -89,6 +96,7 @@ async def _decide_leave_internal(
             {
                 "$set": {
                     "status": "APPROVED",
+                    "unpaid": unpaid,
                     "decidedBy": decider_id,
                     "decidedByRole": decider_role,
                     "decidedAt": now,
@@ -103,10 +111,16 @@ async def _decide_leave_internal(
         # (Sundays + declared holidays are skipped, same as the balance
         # charge). Race-safe: never clobber a date that already has a
         # record (e.g. a real check-in).
+        is_half = bool(req.get("halfDay"))
+        half_part = req.get("halfDayPart") if is_half else None
         leave_note = f"{req.get('leaveTypeCode', '')} leave".strip()
-        if req.get("halfDay"):
-            part = req.get("halfDayPart")
-            leave_note += f" (half day{f' — {part}' if part else ''})"
+        if unpaid:
+            # The calendar historically sniffed this note for "LOP" to colour
+            # unpaid days. It now reads the explicit `unpaid` field below;
+            # the wording stays for older records and for human readers.
+            leave_note = f"LOP {leave_note}".strip()
+        if is_half:
+            leave_note += f" (half day{f' — {half_part}' if half_part else ''})"
         for ymd in await _working_dates_in_range(
             req["fromDate"], req["toDate"]
         ):
@@ -118,7 +132,13 @@ async def _decide_leave_internal(
                     "userId": req["userId"],
                     "date": ymd,
                     "attendanceType": "LEAVE",
-                    "status": "ON_LEAVE",
+                    # A half-day leave is only half off, so it must not read as
+                    # a full ON_LEAVE day — the calendar and the payroll LOP
+                    # count both key off status.
+                    "status": "HALF_DAY" if is_half else "ON_LEAVE",
+                    "halfDay": is_half,
+                    "halfDayPart": half_part,
+                    "unpaid": unpaid,
                     "checkIn": None,
                     "checkOut": None,
                     "workNotes": leave_note,
@@ -127,6 +147,26 @@ async def _decide_leave_internal(
                     "createdAt": now,
                     "updatedAt": now,
                 })
+            elif is_half and not already.get("halfDay"):
+                # Half-day leave usually lands on a day the employee DID work
+                # the other half, so a record already exists. Skipping it (the
+                # old behaviour) left the leave invisible everywhere. Annotate
+                # the real check-in instead of clobbering it.
+                await db.attendance.update_one(
+                    {"_id": already["_id"]},
+                    {
+                        "$set": {
+                            "halfDay": True,
+                            "halfDayPart": half_part,
+                            "leaveRequestId": str(oid),
+                            "workNotes": (
+                                f"{already.get('workNotes', '')} · {leave_note}"
+                                .strip(" ·")
+                            ),
+                            "updatedAt": now,
+                        }
+                    },
+                )
 
         try:
             await push_to_user(
@@ -337,6 +377,7 @@ def _serialize_request(
         "reason": r.get("reason"),
         "attachmentUrl": r.get("attachmentUrl"),
         "status": r.get("status"),
+        "unpaid": r.get("unpaid", False),
         "decisionNote": r.get("decisionNote", ""),
         "decidedBy": r.get("decidedBy"),
         "decidedAt": (

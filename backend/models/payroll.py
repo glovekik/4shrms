@@ -10,6 +10,12 @@ PayrollStatus = Literal["DRAFT", "PROCESSED", "LOCKED"]
 class SalaryStructureCreate(BaseModel):
     """All amounts are monthly, in INR (rupees)."""
 
+    # Company-provided accommodation. Drives the HRA / Other Allowance
+    # split: HRA only applies to someone paying their own rent, so when
+    # accommodation is provided HRA is 0 and its share moves to Other
+    # Allowance. Stored so a structure can be re-derived and audited.
+    accommodation: bool = False
+
     # Earnings
     basic: float
     hra: float = 0.0

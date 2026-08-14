@@ -301,6 +301,12 @@ async def _insert_message(
         "channelId": channel_id,
         "messageId": str(msg["_id"]),
         "authorId": user_id,
+        # The Android client rebuilds the notification itself with notifee
+        # (MessagingStyle), so the sender and the text have to travel in the
+        # DATA payload — an FCM `notification` block only carries one title
+        # and one body, which is why ten messages used to mean ten cards.
+        "authorName": author_name or "Someone",
+        "body": snippet,
     }
 
     if channel_type == "office":
@@ -318,8 +324,20 @@ async def _insert_message(
 
         if recipient_ids:
             title = f"{author_name} · Office chat"
+            office_data = {**chat_data, "channelName": "Office chat"}
             try:
-                await push_to_users(recipient_ids, title, snippet, chat_data)
+                # One notification per conversation, not per message — a busy
+                # office chat used to bury everything else in the shade.
+                await push_to_users(
+                    recipient_ids,
+                    title,
+                    snippet,
+                    office_data,
+                    collapse_key="chat:office",
+                    # Data-only on Android: the client builds a MessagingStyle
+                    # card so ten messages land in one expandable entry.
+                    data_only_android=True,
+                )
             except Exception:
                 pass
             for rid in recipient_ids:
@@ -343,13 +361,17 @@ async def _insert_message(
             recipients.discard(user_id)
             recipients.difference_update(resolved_mentions)
             if recipients:
-                title = (
-                    f"{author_name} · "
-                    f"{team.get('name') or 'Team chat'}"
-                )
+                team_name = team.get("name") or "Team chat"
+                title = f"{author_name} · {team_name}"
+                team_data = {**chat_data, "channelName": team_name}
                 try:
                     await push_to_users(
-                        list(recipients), title, snippet, chat_data,
+                        list(recipients),
+                        title,
+                        snippet,
+                        team_data,
+                        collapse_key=f"chat:team:{channel_id}",
+                        data_only_android=True,
                     )
                 except Exception:
                     pass

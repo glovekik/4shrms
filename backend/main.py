@@ -219,6 +219,9 @@ app.add_middleware(
         "https://hrms.4sightai.com",
         "http://localhost:3000",
         "http://localhost:5173",
+        # Expo's web dev server — without this, `expo start` on web can't
+        # reach a locally-run backend at all (browser blocks every call).
+        "http://localhost:8081",
     ],
     allow_credentials=True,
     allow_methods=["*"],

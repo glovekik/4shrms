@@ -120,6 +120,61 @@ async def list_user_directory(
     return {"items": items, "nextCursor": next_cursor}
 
 
+# ================= Public-ish profile card =================
+@router.get("/users/{user_id}/card")
+async def get_user_card(
+    user_id: str,
+    _viewer_id: str = Depends(get_current_user),
+):
+    """Basic profile any signed-in colleague may see (chat, directory).
+
+    Deliberately NARROW. The HR profile endpoint carries salary, PAN, bank,
+    statutory IDs and home address; none of that belongs in a card a peer can
+    open from a chat message, so this builds an explicit allow-list rather
+    than filtering an HR document down — a new sensitive field added to the
+    user model can't leak in through here by accident.
+    """
+    try:
+        oid = ObjectId(user_id)
+    except (InvalidId, TypeError):
+        raise HTTPException(400, "Invalid user id")
+
+    u = await db.users.find_one({"_id": oid})
+    if not u:
+        raise HTTPException(404, "User not found")
+
+    work = u.get("work") or {}
+    personal = u.get("personal") or {}
+
+    department = None
+    dept_id = u.get("departmentId") or work.get("departmentId")
+    if dept_id:
+        try:
+            d = await db.departments.find_one({"_id": ObjectId(dept_id)})
+            department = (d or {}).get("name")
+        except (InvalidId, TypeError):
+            department = None
+
+    return {
+        "id": str(u["_id"]),
+        "name": u.get("name"),
+        "email": u.get("email"),
+        "profilePictureUrl": u.get("profilePictureUrl"),
+        "employeeCode": u.get("employeeCode"),
+        "tag": u.get("tag"),
+        "status": u.get("status"),
+        "designation": work.get("jobTitle") or work.get("jobPosition"),
+        "department": department,
+        "workLocation": work.get("workLocation"),
+        # Work phone only — the personal number is not a colleague's business.
+        "workPhone": u.get("workPhone"),
+        "joiningDate": u.get("joiningDate"),
+        # Birthday without the year: the app already surfaces birthdays in
+        # the sidebar, but age is not ours to publish.
+        "birthday": (personal.get("birthday") or "")[5:] or None,
+    }
+
+
 # ================= Employee self-service profile =================
 # The employee can view their own profile and fill in personal details
 # that HR left blank ("pending"). Bank account & statutory IDs are HR-only
