@@ -30,6 +30,8 @@ async def _dispatch(
     data: Optional[dict],
     channel_id: Optional[str],
     sound: str,
+    collapse_key: Optional[str] = None,
+    data_only_android: bool = False,
 ) -> None:
     """Route each token to the right transport: native tokens → FCM HTTP v1,
     Expo tokens → Expo push. Prunes tokens FCM reports as dead."""
@@ -41,10 +43,16 @@ async def _dispatch(
 
     if expo:
         await _send_messages(
-            [_message(t, title, body, data, channel_id, sound) for t in expo]
+            [
+                _message(t, title, body, data, channel_id, sound, collapse_key)
+                for t in expo
+            ]
         )
     if fcm:
-        invalid = await send_fcm(fcm, title, body, data, channel_id, sound)
+        invalid = await send_fcm(
+            fcm, title, body, data, channel_id, sound, collapse_key,
+            data_only=data_only_android,
+        )
         if invalid:
             try:
                 await db.push_tokens.delete_many({"token": {"$in": invalid}})
@@ -67,9 +75,17 @@ async def _send_messages(messages: list[dict]) -> None:
         print(f"[push] send failed: {e}")
 
 
-def _message(token, title, body, data, channel_id, sound):
+def _message(token, title, body, data, channel_id, sound, collapse_key=None):
     """Build one Expo push message. channel_id routes Android notifications to
-    a specific channel (its own sound + vibration); ignored on iOS."""
+    a specific channel (its own sound + vibration); ignored on iOS.
+
+    collapse_key is accepted but deliberately NOT forwarded to Expo: it is not
+    a documented field of the Expo push API, and an unrecognised field risks
+    the whole message being rejected — losing the notification entirely is far
+    worse than failing to group it. Grouping is applied on the native FCM path
+    (see utils/fcm.py), which is where the stacking problem actually shows up;
+    iOS already groups notifications per-app by itself.
+    """
     msg = {
         "to": token,
         "title": title,
@@ -89,6 +105,8 @@ async def push_to_user(
     data: Optional[dict] = None,
     channel_id: Optional[str] = None,
     sound: str = "default",
+    collapse_key: Optional[str] = None,
+    data_only_android: bool = False,
 ) -> None:
     """Send to all of one user's registered tokens."""
     tokens = []
@@ -99,7 +117,10 @@ async def push_to_user(
     if not tokens:
         return
 
-    await _dispatch(tokens, title, body, data, channel_id, sound)
+    await _dispatch(
+        tokens, title, body, data, channel_id, sound, collapse_key,
+        data_only_android,
+    )
 
 
 async def push_to_users(
@@ -109,6 +130,8 @@ async def push_to_users(
     data: Optional[dict] = None,
     channel_id: Optional[str] = None,
     sound: str = "default",
+    collapse_key: Optional[str] = None,
+    data_only_android: bool = False,
 ) -> None:
     """Bulk send to many users in one Expo call."""
     user_ids = list({uid for uid in user_ids if uid})
@@ -125,4 +148,7 @@ async def push_to_users(
     if not tokens:
         return
 
-    await _dispatch(tokens, title, body, data, channel_id, sound)
+    await _dispatch(
+        tokens, title, body, data, channel_id, sound, collapse_key,
+        data_only_android,
+    )
