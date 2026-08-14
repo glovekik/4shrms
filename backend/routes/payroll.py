@@ -69,6 +69,9 @@ def _serialize_structure(s: dict) -> dict:
         "userId": s.get("userId"),
         "effectiveFrom": s.get("effectiveFrom"),
         "effectiveTo": s.get("effectiveTo"),
+        # Drives the HRA / Other Allowance split — returned so the editor
+        # can reopen a saved structure with the right toggle state.
+        "accommodation": bool(s.get("accommodation", False)),
         # Earnings
         "basic": s.get("basic", 0),
         "hra": s.get("hra", 0),
@@ -510,20 +513,36 @@ async def process_payroll_run(
         # be docked. The old (effective_working_days - attended) formula counted
         # every weekend as LOP, docking ~5 days/month from a full-attendance
         # employee.
-        lop_days = await db.attendance.count_documents({
-            "userId": user_id,
-            "date": {"$gte": from_d, "$lte": to_d},
-            "$or": [
-                {"status": "ABSENT"},
-                {"unpaid": True},
-            ],
-        })
+        # Summed, not counted: count_documents can only ever return whole
+        # rows, so a half-day unpaid leave was billed as a full day of LOP
+        # and 1.5 days could never appear anywhere downstream. A half-day
+        # row contributes 0.5; everything else a full day.
+        lop_days = 0.0
+        async for _row in db.attendance.find(
+            {
+                "userId": user_id,
+                "date": {"$gte": from_d, "$lte": to_d},
+                "$or": [
+                    {"status": "ABSENT"},
+                    {"unpaid": True},
+                ],
+            },
+            {"halfDay": 1, "status": 1},
+        ):
+            lop_days += (
+                0.5
+                if _row.get("halfDay") or _row.get("status") == "HALF_DAY"
+                else 1.0
+            )
+        lop_days = round(lop_days, 2)
 
         # "Attended" (paid days) = workingDays minus unpaid absences. This
         # intentionally counts Sundays / week-offs / public holidays as
         # attended, since they are paid — so on screen attended + LOP always
         # equals workingDays instead of leaving a phantom weekend gap.
-        attended = max(0, working_days - lop_days)
+        # Fractional too — with a half-day LOP this is e.g. 21.5, and
+        # attended + LOP must still equal workingDays exactly.
+        attended = round(max(0.0, working_days - lop_days), 2)
 
         resolved = resolve_structure_amounts(structure)
         totals_full = compute_totals(resolved)
