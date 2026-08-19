@@ -65,12 +65,27 @@ def resolve_structure_amounts(structure: dict) -> dict:
 
 
 def compute_totals(s: dict) -> dict:
-    """Compute totalGross / totalDeductions / netPay from a resolved structure."""
-    earnings_keys = (
+    """Split a resolved structure into cash pay, employer cost and net.
+
+    `totalGross` is CASH ONLY — what the employee is actually paid. Employer
+    PF and employer-paid insurance are cost-to-company, not money that
+    reaches the employee, so they are reported separately as `employerCost`
+    and combined into `totalCTC`.
+
+    This used to fold employer contributions into `totalGross`, which had two
+    consequences: the salary list showed a net well above the real bank
+    credit, and — worse — LOP was priced off that inflated gross, so one day
+    of loss-of-pay deducted more than one day of actual cash pay.
+
+    Anything that genuinely wants the CTC figure should read `totalCTC`.
+    """
+    cash_keys = (
         "basic",
         "hra",
         "communicationAllowance",
         "otherAllowance",
+    )
+    employer_keys = (
         "employerPF",
         "employerInsurance",
     )
@@ -81,13 +96,16 @@ def compute_totals(s: dict) -> dict:
         "employeeInsurance",
     )
 
-    total_gross = sum(float(s.get(k, 0) or 0) for k in earnings_keys)
+    total_gross = sum(float(s.get(k, 0) or 0) for k in cash_keys)
+    employer_cost = sum(float(s.get(k, 0) or 0) for k in employer_keys)
     total_deductions = sum(
         float(s.get(k, 0) or 0) for k in deduction_keys
     )
 
     return {
         "totalGross": round(total_gross, 2),
+        "employerCost": round(employer_cost, 2),
+        "totalCTC": round(total_gross + employer_cost, 2),
         "totalDeductions": round(total_deductions, 2),
         "netPay": round(total_gross - total_deductions, 2),
     }
