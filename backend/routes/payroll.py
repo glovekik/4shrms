@@ -32,6 +32,7 @@ from utils.pdf import build_payslip_pdf, PAYSLIP_PDF_VERSION
 from utils.email import send_email_with_pdf
 from utils.push import push_to_users
 from utils.notify import create_notification
+from utils.audit import log_audit
 from config import (
     COMPANY_NAME,
     is_email_configured,
@@ -95,6 +96,9 @@ def _serialize_structure(s: dict) -> dict:
         "tdsRegime": s.get("tdsRegime", "NEW"),
         # Computed totals (from snapshot at save time)
         "totalGross": s.get("totalGross", 0),
+        # Cash gross excludes employer PF/insurance; totalCTC adds them back.
+        "employerCost": s.get("employerCost", 0),
+        "totalCTC": s.get("totalCTC", 0),
         "totalDeductions": s.get("totalDeductions", 0),
         "netPay": s.get("netPay", 0),
         "createdAt": (
@@ -166,6 +170,8 @@ def _serialize_payslip(
         "lopDeduction": p.get("lopDeduction", 0),
         # Computed totals
         "totalGross": p.get("totalGross", 0),
+        "employerCost": p.get("employerCost", 0),
+        "totalCTC": p.get("totalCTC", 0),
         "totalDeductions": p.get("totalDeductions", 0),
         "netPay": p.get("netPay", 0),
         # Status
@@ -596,6 +602,8 @@ async def process_payroll_run(
             "lopDeduction": lop_deduction,
             # Computed
             "totalGross": final_gross,
+            "employerCost": totals_full["employerCost"],
+            "totalCTC": round(final_gross + totals_full["employerCost"], 2),
             "totalDeductions": total_deductions,
             "netPay": net_pay,
             "status": "GENERATED",
@@ -781,6 +789,8 @@ async def override_payslip(
     )
     update["lopDeduction"] = lop_deduction
     update["totalGross"] = final_gross
+    update["employerCost"] = totals_full["employerCost"]
+    update["totalCTC"] = round(final_gross + totals_full["employerCost"], 2)
     update["totalDeductions"] = totals_full["totalDeductions"]
     update["netPay"] = round(
         final_gross - totals_full["totalDeductions"], 2
@@ -1032,6 +1042,79 @@ def _default_body(user: dict, payslip: dict) -> str:
         f"Net pay: INR {payslip.get('netPay', 0):,.2f}\n\n"
         f"Regards,\n{COMPANY_NAME}"
     )
+
+
+@hr_router.delete("/payslips/{id}")
+async def delete_payslip(
+    id: str,
+    _hr: dict = Depends(require_hr),
+):
+    """Remove ONE payslip, leaving the rest of the run untouched.
+
+    For the case where a slip should not have been generated at all — a
+    wrong employee, a duplicate, a leaver. Deleting is scoped to the single
+    document: the payroll run, its other payslips and the employee's salary
+    structure are all untouched, and the run is NOT reprocessed.
+
+    Refused once the parent run is LOCKED — a locked run is the audit record
+    of what was paid, so slips cannot be removed from it.
+
+    Note: re-processing the run regenerates every payslip from the salary
+    structures, so a deleted slip WILL come back if HR reprocesses.
+    """
+    try:
+        oid = ObjectId(id)
+    except (InvalidId, TypeError):
+        raise HTTPException(400, "Invalid id")
+
+    p = await db.payslips.find_one({"_id": oid})
+    if not p:
+        raise HTTPException(404, "Payslip not found")
+
+    run = None
+    if p.get("payrollRunId"):
+        try:
+            run = await db.payroll_runs.find_one(
+                {"_id": ObjectId(p["payrollRunId"])}
+            )
+        except (InvalidId, TypeError):
+            run = None
+    if run and run.get("status") == "LOCKED":
+        raise HTTPException(400, "Parent payroll run is LOCKED")
+
+    # Drop the cached PDF too, or the blob is orphaned in GridFS forever.
+    if p.get("pdfFileId"):
+        try:
+            await _bucket().delete(ObjectId(p["pdfFileId"]))
+        except Exception:
+            pass
+
+    await db.payslips.delete_one({"_id": oid})
+
+    # Keep the run's counter honest — it drives the list header.
+    if run is not None:
+        remaining = await db.payslips.count_documents(
+            {"payrollRunId": p.get("payrollRunId")}
+        )
+        await db.payroll_runs.update_one(
+            {"_id": run["_id"]},
+            {"$set": {"payslipCount": remaining}},
+        )
+
+    await log_audit(
+        actor_id=str(_hr["_id"]),
+        action="payslip.delete",
+        entity_type="payslips",
+        entity_id=id,
+        before={
+            "userId": p.get("userId"),
+            "year": p.get("year"),
+            "month": p.get("month"),
+            "netPay": p.get("netPay"),
+        },
+    )
+
+    return {"message": "Payslip deleted"}
 
 
 @hr_router.post("/payslips/{id}/email")
