@@ -505,6 +505,15 @@ async def get_me(
         if user_id in t.get("memberIds", []):
             member_of_team_ids.append(team_id)
 
+    # How many people actually report to this user. The MANAGER role says
+    # what someone may do; this says whether there is anyone to do it to.
+    # The app uses it to decide whether to show the manager tabs at all —
+    # a manager whose last report was reassigned keeps the role, and was
+    # left with My Team, Approvals and Team Tasks all permanently empty.
+    direct_report_count = await db.users.count_documents(
+        {"reportingManagerId": user_id}
+    )
+
     return {
 
         "id":
@@ -562,6 +571,9 @@ async def get_me(
 
         "memberOfTeamIds":
         member_of_team_ids,
+
+        "directReportCount":
+        direct_report_count,
     }
 
 

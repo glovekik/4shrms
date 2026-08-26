@@ -1,7 +1,11 @@
 """Company org chart: CEO → department → project → employee.
 
-Read-only and company-wide — everyone can see the shape of the organisation.
-Sensitive fields are deliberately excluded; this returns names, titles and
+Read-only, and limited to HR, the CEO, and managers who actually have direct
+reports. It lays out the whole company's reporting and project structure at
+once, which is management context rather than something every employee needs.
+
+Hiding the tab is not enough on its own — the route has to refuse too, or the
+URL is still reachable. Fields are narrow regardless: names, titles and
 avatars only, never contact details, salary or personal data.
 
 The tree is assembled from data that is only partly populated in practice, so
@@ -11,17 +15,36 @@ place in the response. A chart that silently drops eleven people is worse than
 one that shows them in an "unassigned" bucket.
 """
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 
 from bson import ObjectId
 from bson.errors import InvalidId
 
 from database import db
-from utils.dependencies import get_current_user
+from utils.dependencies import get_current_user_doc, has_direct_reports
 from utils import project_members as pm
 
 
 router = APIRouter()
+
+
+async def require_org_viewer(
+    user: dict = Depends(get_current_user_doc),
+) -> dict:
+    """HR, CEO, or a manager with at least one direct report.
+
+    Matches require_manager_or_hr's rule that the MANAGER role alone doesn't
+    grant management surfaces — someone has to actually report to them.
+    """
+    role = user.get("role")
+    if role in ("HR", "CEO"):
+        return user
+    if role == "MANAGER" and await has_direct_reports(str(user["_id"])):
+        return user
+    raise HTTPException(
+        403,
+        "The organization chart is available to HR, the CEO and managers.",
+    )
 
 
 # People who have left shouldn't appear on the chart.
@@ -45,7 +68,7 @@ def _person(u: dict) -> dict:
 
 
 @router.get("/chart")
-async def org_chart(_user_id: str = Depends(get_current_user)):
+async def org_chart(_viewer: dict = Depends(require_org_viewer)):
     people: dict[str, dict] = {}
     async for u in db.users.find(
         {"status": {"$nin": list(_EXCLUDED_STATUSES)}},
@@ -132,7 +155,7 @@ async def org_chart(_user_id: str = Depends(get_current_user)):
 @router.get("/people/{user_id}/projects")
 async def person_projects(
     user_id: str,
-    _viewer_id: str = Depends(get_current_user),
+    _viewer: dict = Depends(require_org_viewer),
 ):
     """Every project this person is on, and every one they've left.
 

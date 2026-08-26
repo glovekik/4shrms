@@ -155,20 +155,50 @@ async def require_hr_or_ceo(
 
 
 # ================= ROLE GUARD: MANAGER OR HR =================
+async def has_direct_reports(user_id: str) -> bool:
+    """Does anyone actually report to this person?
+
+    The MANAGER role says what someone *may* do; this says whether there is
+    anyone to do it to. Kept separate because the two drift: reassigning a
+    manager's last report leaves the role behind, and nothing was checking.
+    """
+    return await db.users.count_documents(
+        {"reportingManagerId": user_id}, limit=1
+    ) > 0
+
+
 async def require_manager_or_hr(
     user: dict = Depends(get_current_user_doc),
 ):
-    """Allows users with role MANAGER or HR.
+    """Allows HR, and managers who actually have direct reports.
 
     Why: PRD wording — leave/correction/expense approvals are
     "Employee → Manager OR HR → Approved/Rejected". A Manager can act on
     their direct reports; HR can act on anyone. Scope filtering (only
     *my* reports) is enforced inside the endpoint, not here.
+
+    The report check exists because the role outlives the reporting line.
+    Move a manager's last report to someone else and they keep role=MANAGER,
+    so every approval queue and team report stayed reachable — all of them
+    empty, because the scope filtering inside each endpoint correctly found
+    nobody. Empty screens that look broken, and a manager console for
+    someone who manages no one. A 403 with a plain reason beats both.
     """
-    if user.get("role") not in ("HR", "MANAGER"):
+    role = user.get("role")
+    if role == "HR":
+        return user
+    if role != "MANAGER":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Manager or HR access required",
+        )
+    if not await has_direct_reports(str(user["_id"])):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "You don't have any direct reports, so there is nothing to "
+                "manage here. Ask HR if this looks wrong."
+            ),
         )
 
     return user
