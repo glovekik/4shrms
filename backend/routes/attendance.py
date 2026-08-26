@@ -223,7 +223,21 @@ async def checkin(
         "date": today
     })
 
-    if existing:
+    # A half-day leave approved IN ADVANCE writes tomorrow's attendance row at
+    # approval time (routes/leave.py), with status HALF_DAY and no checkIn.
+    # That row then blocked the employee from checking in for the half they
+    # actually work — they lost the whole day. Let them check into it: the
+    # half-day status, the leave link and the note all stay, only the check-in
+    # is filled. Any row they've already checked into still blocks, so this
+    # can't be used to overwrite a real check-in.
+    _resumable_leave_half_day = bool(
+        existing
+        and existing.get("halfDay")
+        and not existing.get("checkIn")
+        and existing.get("autoAppliedFromLeave")
+    )
+
+    if existing and not _resumable_leave_half_day:
 
         raise HTTPException(
             status_code=400,
@@ -287,9 +301,22 @@ async def checkin(
         current_time,
     }
 
-    await db.attendance.insert_one(
-        attendance
-    )
+    if _resumable_leave_half_day:
+        # Fill in the check-in on the pre-created half-day row instead of
+        # inserting a second one — (userId, date) is uniquely indexed, so an
+        # insert here would raise a duplicate-key error. `status` stays
+        # HALF_DAY: the person is working half a day, not a full one, and the
+        # payroll LOP and attendance-rate maths both key off that.
+        attendance.pop("status", None)
+        attendance.pop("createdAt", None)
+        await db.attendance.update_one(
+            {"_id": existing["_id"]},
+            {"$set": attendance},
+        )
+    else:
+        await db.attendance.insert_one(
+            attendance
+        )
 
     # For client check-ins, tell the reporting manager + HR where the person
     # is working from (mirrors the old client-location notification).

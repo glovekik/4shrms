@@ -9,10 +9,50 @@ from dotenv import load_dotenv
 # in production, just don't ship a .env file and platform vars take over.
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
-SECRET_KEY = os.getenv(
-    "SECRET_KEY",
+# ================= DATABASE (MongoDB) =================
+# Read straight from the .env loaded above so database.py uses exactly these
+# values. No localhost fallback on purpose — a missing/empty MONGO_URL should
+# fail loudly at startup (see database.py) instead of silently connecting to
+# a nonexistent local mongod, which only surfaces later as a confusing
+# "localhost:27017 connection refused".
+MONGO_URL = os.getenv("MONGO_URL", "").strip()
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "attendance_db").strip()
+
+
+# ================= AUTH =================
+# This key signs every JWT. It previously defaulted to the literal string
+# "attendance_secret_key", which is committed to this repo — so a deploy that
+# forgot to set SECRET_KEY would boot happily and sign tokens anyone reading
+# the source could forge, for any user id, including HR. A missing signing
+# key has to stop the process, not fall back to a public constant.
+#
+# The check is relaxed only when the database is local, so a dev machine
+# running against its own mongod isn't forced to invent a strong key.
+SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
+
+_LOCAL_DB = any(h in MONGO_URL for h in ("127.0.0.1", "localhost", "::1"))
+_WEAK_KEYS = {
     "attendance_secret_key",
-)
+    "local_dev_secret_change_me",
+    "changeme",
+    "change_me",
+    "secret",
+    "supersecret",
+}
+
+if not SECRET_KEY:
+    raise RuntimeError(
+        "SECRET_KEY is not set. Define it in backend/.env or pass it to the "
+        "container (-e SECRET_KEY=...). Refusing to fall back to a hardcoded "
+        "key: it is public in this repo and would make every JWT forgeable."
+    )
+
+if not _LOCAL_DB and (SECRET_KEY in _WEAK_KEYS or len(SECRET_KEY) < 32):
+    raise RuntimeError(
+        "SECRET_KEY is weak or a known placeholder, and MONGO_URL points at a "
+        "non-local database. Generate a real one:\n"
+        "    python -c \"import secrets; print(secrets.token_urlsafe(48))\""
+    )
 
 ALGORITHM = "HS256"
 
@@ -24,15 +64,6 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 # (db.refresh_tokens) so it can be revoked on logout / compromise.
 REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "30"))
 
-
-# ================= DATABASE (MongoDB) =================
-# Read straight from the .env loaded above so database.py uses exactly these
-# values. No localhost fallback on purpose — a missing/empty MONGO_URL should
-# fail loudly at startup (see database.py) instead of silently connecting to
-# a nonexistent local mongod, which only surfaces later as a confusing
-# "localhost:27017 connection refused".
-MONGO_URL = os.getenv("MONGO_URL", "").strip()
-MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "attendance_db").strip()
 
 
 # ================= COMPANY (used in payslip PDFs / emails) =================

@@ -243,10 +243,6 @@ def _today_str() -> str:
     return today_ist_str()
 
 
-def _yesterday_str() -> str:
-    return (today_ist_date() - timedelta(days=1)).strftime("%Y-%m-%d")
-
-
 # ================= HR: SALARY STRUCTURE =================
 @hr_router.post("/users/{userId}/salary-structure")
 async def set_salary_structure(
@@ -273,23 +269,71 @@ async def set_salary_structure(
 
     now = datetime.now(timezone.utc)
     today = _today_str()
-    yesterday = _yesterday_str()
 
-    # Close any currently-active structure.
-    await db.salary_structures.update_many(
-        {"userId": userId, "effectiveTo": None},
-        {
-            "$set": {
-                "effectiveTo": yesterday,
-                "updatedAt": now,
-            }
-        },
+    # Backdating. Without this, a correction always started today, so
+    # re-running an earlier month still matched the OLD (wrong) structure and
+    # the payslip came out unchanged — which is exactly what was reported.
+    effective_from = (data.effectiveFrom or "").strip() or today
+    try:
+        eff_date = date.fromisoformat(effective_from)
+    except ValueError:
+        raise HTTPException(400, "effectiveFrom must be YYYY-MM-DD")
+    if effective_from > today:
+        raise HTTPException(400, "effectiveFrom cannot be in the future")
+    day_before = (eff_date - timedelta(days=1)).isoformat()
+
+    # Two rows must never claim the same day, or "the salary that applied in
+    # May" is ambiguous. Splitting the reconciliation by which side of
+    # `effective_from` a row starts on is what keeps it non-destructive:
+    # an earlier row gets truncated, a later row is left completely alone.
+
+    # Same start date — the only genuinely ambiguous case. Refusing is safer
+    # than guessing: closing it would produce a zero-length window, and
+    # deleting it would silently discard a real structure.
+    clash = await db.salary_structures.find_one(
+        {"userId": userId, "effectiveFrom": effective_from}
     )
+    if clash:
+        raise HTTPException(
+            400,
+            f"A salary structure already starts on {effective_from}. "
+            "Delete that one first, or choose a different effective date.",
+        )
+
+    # Rows that started BEFORE the new one and still cover it get truncated to
+    # the day before. Scoped to `effectiveFrom < effective_from` so a later
+    # structure can never be caught by this — the previous version closed
+    # every open row, which corrupted any structure starting after the new
+    # date and then deleted it as an "impossible window".
+    await db.salary_structures.update_many(
+        {
+            "userId": userId,
+            "effectiveFrom": {"$lt": effective_from},
+            "$or": [
+                {"effectiveTo": None},
+                {"effectiveTo": {"$gte": effective_from}},
+            ],
+        },
+        {"$set": {"effectiveTo": day_before, "updatedAt": now}},
+    )
+
+    # If a structure already starts after this one, the new row is a
+    # historical correction slotted in behind it — so it ends where that one
+    # begins rather than staying open and overlapping it.
+    nxt = await db.salary_structures.find_one(
+        {"userId": userId, "effectiveFrom": {"$gt": effective_from}},
+        sort=[("effectiveFrom", 1)],
+    )
+    effective_to = None
+    if nxt:
+        effective_to = (
+            date.fromisoformat(nxt["effectiveFrom"]) - timedelta(days=1)
+        ).isoformat()
 
     doc = {
         "userId": userId,
-        "effectiveFrom": today,
-        "effectiveTo": None,
+        "effectiveFrom": effective_from,
+        "effectiveTo": effective_to,
         **resolved,
         **totals,
         "createdBy": str(hr["_id"]),
@@ -299,6 +343,21 @@ async def set_salary_structure(
 
     result = await db.salary_structures.insert_one(doc)
     doc["_id"] = result.inserted_id
+
+    # Salary is the most consequential thing HR can change here, and the old
+    # code path could destroy a structure with no record of it at all.
+    await log_audit(
+        actor_id=str(hr["_id"]),
+        action="salary_structure.create",
+        entity_type="salary_structures",
+        entity_id=str(result.inserted_id),
+        after={
+            "userId": userId,
+            "effectiveFrom": effective_from,
+            "effectiveTo": effective_to,
+            "totalGross": totals.get("totalGross"),
+        },
+    )
 
     return _serialize_structure(doc)
 

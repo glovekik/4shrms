@@ -33,6 +33,18 @@ sa.json
 # Tests + helper scripts that don't need to ship to the server.
 test_*.py
 bootstrap_test_*.py
+# Local-only seeder. It refuses to run against anything but a local mongod,
+# but a data-generating script has no business inside a production image.
+seed_local_test.py
+
+# One-off migration/maintenance scripts. These are run deliberately from a
+# checkout against a named database, never from inside the running container.
+migrate_*.py
+rollback_*.py
+promote_ceo.py
+
+# Local DB snapshots — these contain real employee records.
+backups/
 
 # Docs (keep the image lean — these stay in the repo).
 *.md

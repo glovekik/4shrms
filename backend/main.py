@@ -1,8 +1,10 @@
 import logging
+import os
 import time
 from collections import defaultdict
 
 from fastapi import FastAPI, Request
+
 
 from fastapi.middleware.cors import (
     CORSMiddleware
@@ -23,9 +25,9 @@ from routes.hr import (
     router as hr_router
 )
 
-from routes.tl import (
-    router as tl_router
-)
+# Team-lead routes retired in Phase 4 — projects absorbed teams, and project
+# managers now own task assignment via /projects/{id}/tasks. routes/tl.py is
+# left on disk unmounted until the next release confirms nothing depended on it.
 
 from routes.manager_tasks import (
     router as manager_tasks_router,
@@ -42,7 +44,8 @@ from routes.tasks import (
 
 from routes.chat import (
     office_router as office_chat_router,
-    team_router as team_chat_router,
+    project_router as project_chat_router,
+    list_router as chat_list_router,
 )
 
 from routes.corrections import (
@@ -68,6 +71,8 @@ from routes.notifications import router as notifications_router
 
 from routes.dashboard import router as dashboard_router
 
+from routes.chat_groups import router as chat_groups_router
+from routes.org import router as org_router
 from routes.projects import (
     user_router as projects_user_router,
     hr_router as projects_hr_router,
@@ -213,16 +218,47 @@ async def healthz():
 # ================= CORS =================
 # allow_credentials must be False when allow_origins=["*"]
 # (browsers reject the wildcard with credentials enabled).
+# Origins are env-driven so production doesn't carry dev entries. With
+# allow_credentials=True a listed origin can make authenticated calls, so the
+# localhost entries are a real (if small) widening of who can talk to the API
+# with a user's cookies — they belong on a laptop, not on hrmsapi.
+#
+# Two knobs, deliberately independent of everything else:
+#   CORS_ORIGINS    — comma-separated; replaces the list outright.
+#   ENABLE_DEV_CORS — adds the localhost origins.
+#
+# This used to infer "dev" from MONGO_URL pointing at a local database, which
+# was simply the wrong signal: a developer running the API on their laptop
+# against the PRODUCTION database is still serving a browser on
+# localhost:8081, and that inference silently blocked every request from it.
+# Where the data lives says nothing about where the page is served from.
+_default_origins = ["https://hrms.4sightai.com"]
+_dev_origins = [
+    "http://localhost:3000",
+    "http://localhost:5173",
+    # Expo's web dev server — without this, `expo start --web` can't reach a
+    # locally-run backend at all (the browser blocks every call).
+    "http://localhost:8081",
+    "http://localhost:8082",
+]
+
+_configured = [
+    o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()
+]
+_dev_cors = os.getenv("ENABLE_DEV_CORS", "").strip().lower() in (
+    "1", "true", "yes",
+)
+
+if _configured:
+    ALLOWED_ORIGINS = _configured
+else:
+    ALLOWED_ORIGINS = _default_origins + (_dev_origins if _dev_cors else [])
+
+logging.getLogger("api.cors").info("CORS origins: %s", ALLOWED_ORIGINS)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://hrms.4sightai.com",
-        "http://localhost:3000",
-        "http://localhost:5173",
-        # Expo's web dev server — without this, `expo start` on web can't
-        # reach a locally-run backend at all (browser blocks every call).
-        "http://localhost:8081",
-    ],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -338,15 +374,6 @@ app.include_router(
 
 app.include_router(
 
-    tl_router,
-
-    prefix="/tl",
-
-    tags=["TL"]
-)
-
-app.include_router(
-
     tasks_router,
 
     prefix="/tasks",
@@ -363,13 +390,44 @@ app.include_router(
     tags=["Office Chat"]
 )
 
+# Conversation list for the chat home screen.
+app.include_router(
+    chat_list_router,
+    prefix="/chat",
+    tags=["Chat"],
+)
+
+# Company org chart — read-only, any authenticated user.
+app.include_router(
+    org_router,
+    prefix="/org",
+    tags=["Org"],
+)
+
+# Ad-hoc chat groups. Anyone in one can post; only HR can create or manage them.
+app.include_router(
+    chat_groups_router,
+    prefix="/chat/groups",
+    tags=["Chat"],
+)
+
 app.include_router(
 
-    team_chat_router,
+    project_chat_router,
 
+    prefix="/projects",
+
+    tags=["Project Chat"]
+)
+
+# Deprecated alias. Project ids are the old team ids (the Phase 1 migration
+# preserved them), so already-installed app builds calling /teams/{id}/messages
+# keep working against the same handlers. Remove once everyone has updated.
+app.include_router(
+    project_chat_router,
     prefix="/teams",
-
-    tags=["Team Chat"]
+    tags=["Project Chat"],
+    include_in_schema=False,
 )
 
 # Correction-request endpoints attach under /attendance/... and /hr/...

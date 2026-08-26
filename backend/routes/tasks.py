@@ -18,6 +18,8 @@ from utils.email import send_notification_email
 from utils.push import push_to_user
 from utils.notify import create_notification, notify_user
 from models.comment import CommentCreate
+from utils import projects as projects_util
+from utils import project_members as pm
 
 router = APIRouter()
 
@@ -27,6 +29,7 @@ def _serialize(t: dict) -> dict:
     return {
         "id": str(t["_id"]),
         "teamId": t.get("teamId"),
+        "projectId": t.get("projectId"),
         "title": t.get("title"),
         "description": t.get("description", ""),
         "assigneeId": t.get("assigneeId"),
@@ -116,10 +119,13 @@ async def _load_task_or_404(task_id: str) -> dict:
 
 async def _ensure_can_view(task: dict, user: dict) -> None:
     """View access: assignee OR creator OR assignee's reporting manager
-    OR team's TL OR HR."""
+    OR the project's manager OR the legacy team's TL OR HR."""
     user_id = str(user["_id"])
 
-    if user.get("role") == "HR":
+    # CEO reads everything HR reads. Every other check in the project/task
+    # code says ("HR", "CEO"); this one said "HR" alone, so the CEO account
+    # got a 403 on every single task.
+    if user.get("role") in ("HR", "CEO"):
         return
 
     if task.get("assigneeId") == user_id:
@@ -142,18 +148,24 @@ async def _ensure_can_view(task: dict, user: dict) -> None:
         if assignee and str(assignee.get("reportingManagerId")) == user_id:
             return
 
-    try:
-        team_oid = ObjectId(task["teamId"])
-    except (InvalidId, TypeError, KeyError):
-        raise HTTPException(
-            500,
-            "Task has invalid team reference",
-        )
-
-    team = await db.teams.find_one({"_id": team_oid})
-
-    if team and team.get("teamLeadId") == user_id:
+    # A project's manager can see the work on their project.
+    project_id = task.get("projectId")
+    if project_id and await pm.is_project_manager(user_id, project_id):
         return
+
+    # Legacy team-lead access. Guarded on teamId actually being set: it is
+    # null on every manager-issued task, and ObjectId(None) used to raise here
+    # and surface as a 500 instead of the 403 this really is.
+    team_id = task.get("teamId")
+    if team_id:
+        try:
+            team_oid = ObjectId(team_id)
+        except (InvalidId, TypeError):
+            team_oid = None
+        if team_oid is not None:
+            team = await db.teams.find_one({"_id": team_oid})
+            if team and team.get("teamLeadId") == user_id:
+                return
 
     raise HTTPException(
         403,
@@ -165,6 +177,10 @@ async def _ensure_can_view(task: dict, user: dict) -> None:
 @router.get("/my")
 async def my_tasks(
     status: Optional[str] = Query(None),
+    projectId: Optional[str] = Query(
+        None,
+        description="Filter to one project; 'none' for tasks with no project",
+    ),
     before: Optional[str] = Query(None),  # ISO 8601 createdAt
     limit: int = Query(50, ge=1, le=200),
     user_id: str = Depends(get_current_user),
@@ -174,6 +190,11 @@ async def my_tasks(
 
     if status:
         query["status"] = status
+
+    if projectId == "none":
+        query["projectId"] = None
+    elif projectId:
+        query["projectId"] = projectId
 
     if before:
         s = before
@@ -204,11 +225,15 @@ async def my_tasks(
     creator_map = await _get_user_basics(
         t.get("createdBy") for t in raw
     )
+    project_map = await projects_util.brief_map(
+        t.get("projectId") for t in raw
+    )
 
     tasks = []
     for t in raw:
         s = _serialize(t)
         s["createdByUser"] = creator_map.get(t.get("createdBy"))
+        s["project"] = project_map.get(t.get("projectId"))
         tasks.append(s)
 
     return tasks
@@ -237,6 +262,12 @@ async def get_task(
     serialized["createdByUser"] = user_map.get(
         task.get("createdBy")
     )
+
+    if task.get("projectId"):
+        pmap = await projects_util.brief_map([task["projectId"]])
+        serialized["project"] = pmap.get(task["projectId"])
+    else:
+        serialized["project"] = None
 
     return serialized
 
@@ -369,52 +400,59 @@ async def complete_task(
             "updatedAt": now,
         })
 
-    # Notify the team's TL.
+    # Tell whoever is accountable for the work: the project's managers if the
+    # task belongs to a project, otherwise the person who assigned it.
     try:
-        team = await db.teams.find_one({
-            "_id": ObjectId(task["teamId"])
-        })
-        if team and team.get("teamLeadId"):
-            assignee = await db.users.find_one({
-                "_id": ObjectId(user_id)
-            })
-            actor_name = (
-                assignee.get("name")
-                if assignee else "Someone"
-            )
-            await push_to_user(
-                team["teamLeadId"],
-                "Task completed",
-                f"{actor_name}: {task.get('title', '')}",
-                {"type": "task_complete", "taskId": str(task["_id"])},
-            )
-            await create_notification(
-                team["teamLeadId"],
-                "task_complete",
-                "Task completed",
-                f"{actor_name}: {task.get('title', '')}",
-                {"taskId": str(task["_id"])},
-            )
-
+        project = None
+        watcher_ids: list[str] = []
+        project_id = task.get("projectId")
+        if project_id:
+            watcher_ids = await pm.current_manager_ids(project_id)
             try:
-                tl = await db.users.find_one({
-                    "_id": ObjectId(team["teamLeadId"])
-                })
+                project = await db.projects.find_one({"_id": ObjectId(project_id)})
             except (InvalidId, TypeError):
-                tl = None
-            if tl and tl.get("email"):
-                await send_notification_email(
-                    tl["email"],
-                    f"Task completed: {task.get('title', '')}",
-                    (
-                        f"Hi {tl.get('name', 'there')},\n\n"
-                        f"{actor_name} marked the following task complete "
-                        f"in team \"{team.get('name', '')}\":\n\n"
-                        f"Title: {task.get('title', '')}\n\n"
-                        f"Open the app to review.\n\n"
-                        f"Regards,\n{COMPANY_NAME}"
-                    ),
+                project = None
+        elif task.get("createdBy"):
+            watcher_ids = [task["createdBy"]]
+
+        watcher_ids = [w for w in dict.fromkeys(watcher_ids) if w and w != user_id]
+
+        if watcher_ids:
+            assignee = await db.users.find_one({"_id": ObjectId(user_id)})
+            actor_name = assignee.get("name") if assignee else "Someone"
+            where = f" in \"{project.get('name')}\"" if project else ""
+
+            for wid in watcher_ids:
+                await push_to_user(
+                    wid,
+                    "Task completed",
+                    f"{actor_name}: {task.get('title', '')}",
+                    {"type": "task_complete", "taskId": str(task["_id"])},
                 )
+                await create_notification(
+                    wid,
+                    "task_complete",
+                    "Task completed",
+                    f"{actor_name}: {task.get('title', '')}",
+                    {"taskId": str(task["_id"])},
+                )
+                try:
+                    watcher = await db.users.find_one({"_id": ObjectId(wid)})
+                except (InvalidId, TypeError):
+                    watcher = None
+                if watcher and watcher.get("email"):
+                    await send_notification_email(
+                        watcher["email"],
+                        f"Task completed: {task.get('title', '')}",
+                        (
+                            f"Hi {watcher.get('name', 'there')},\n\n"
+                            f"{actor_name} marked the following task complete"
+                            f"{where}:\n\n"
+                            f"Title: {task.get('title', '')}\n\n"
+                            f"Open the app to review.\n\n"
+                            f"Regards,\n{COMPANY_NAME}"
+                        ),
+                    )
     except Exception:
         pass
 

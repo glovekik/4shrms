@@ -209,7 +209,7 @@ class HRUserUpdate(BaseModel):
     Any safety guard on HR promotion lives in the route, not the model.
     """
     name: Optional[str] = None
-    email: Optional[EmailStr] = None
+    email: Optional[NormalizedEmail] = None
     role: Optional[Literal["MANAGER", "USER", "HR"]] = None
     tag: Optional[UserTag] = None
     employeeCode: Optional[str] = None

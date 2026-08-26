@@ -502,8 +502,13 @@ async def update_user(
         )
 
     # Email is the login identity — only change it when it actually
-    # differs, and never let two users share one. Matched exactly, same as
-    # create_user / login (which don't lowercase).
+    # differs, and never let two users share one. `data.email` is a
+    # NormalizedEmail (trimmed + lowercased) exactly like create_user and
+    # login, so the stored value always matches what a login query looks
+    # for. It must stay that way: typing it as a bare EmailStr here let a
+    # mixed-case address reach the database, and the account then became
+    # unreachable — login lowercases the input, so no casing the user
+    # could type would ever match the stored value again.
     if data.email is not None and data.email != existing.get("email"):
         dup = await db.users.find_one(
             {"email": data.email, "_id": {"$ne": oid}}

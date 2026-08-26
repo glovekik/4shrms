@@ -2,7 +2,7 @@ import base64
 import json
 import re
 from datetime import datetime, timezone
-from utils.ist import now_ist_naive, IST
+from utils.ist import IST
 from fastapi import APIRouter, Depends, HTTPException, Query
 from bson import ObjectId
 from bson.errors import InvalidId
@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from typing import Optional
 
 from database import db
+from utils import project_members as pm
 from models.user import PersonalInfo, EmergencyContact
 from utils.audit import log_audit
 from utils.dependencies import get_current_user
@@ -319,56 +320,50 @@ async def update_my_profile_picture(
 # ================= Chat unread badge =================
 # The dashboard Chat tile shows a count of unread chat messages —
 # anything newer than the user's last chat-read marker, across BOTH
-# office chat (company-wide) and team chats they belong to. Author's
+# office chat (company-wide) and project chats they belong to. Author's
 # own messages are excluded.
 
 @router.get("/me/chat-unread")
 async def my_chat_unread(user_id: str = Depends(get_current_user)):
+    """Total unread across office chat and the caller's project chats.
+
+    Counted per channel from `chat_reads`. It previously used a single
+    `chatLastReadAt` on the user, which meant opening office chat marked every
+    project chat read as well and their unread messages disappeared unseen.
+    """
     user = await db.users.find_one({"_id": ObjectId(user_id)})
     if not user:
         raise HTTPException(404, "User not found")
 
-    team_ids: list[str] = []
-    async for t in db.teams.find(
-        {"$or": [{"teamLeadId": user_id}, {"memberIds": user_id}]},
-        {"_id": 1},
-    ):
-        team_ids.append(str(t["_id"]))
+    channels: list[tuple[str, Optional[str]]] = [("office", None)]
+    for pid in await pm.project_ids_for_user(user_id):
+        channels.append(("project", pid))
+    async for g in db.chat_groups.find({"memberIds": user_id}, {"_id": 1}):
+        channels.append(("group", str(g["_id"])))
 
-    # chat_messages.createdAt is stored as IST wall-clock (naive). Compare the
-    # read-marker in the SAME basis, or the badge never clears — a UTC marker
-    # sits ~5.5h "behind" IST-naive timestamps, so just-read messages still
-    # count as unread.
-    since = user.get("chatLastReadAt")
-    if since is None:
-        since = datetime(1970, 1, 1)  # naive; before any message
-    elif since.tzinfo is not None:
-        # Legacy value stored UTC-aware → convert to IST wall-clock naive.
-        since = since.astimezone(IST).replace(tzinfo=None)
+    pointers: dict[tuple, object] = {}
+    async for r in db.chat_reads.find({"userId": user_id}):
+        pointers[(r.get("channelType"), r.get("channelId"))] = r.get("lastReadAt")
 
-    # Office (company-wide) + the user's team channels.
-    channel_clause: list[dict] = [{"channelType": "office"}]
-    if team_ids:
-        channel_clause.append({
-            "channelType": "team",
-            "channelId": {"$in": team_ids},
-        })
+    count = 0
+    for ctype, cid in channels:
+        q: dict = {
+            "channelType": ctype,
+            "channelId": cid,
+            "userId": {"$ne": user_id},
+        }
+        since = pointers.get((ctype, cid))
+        if since is not None:
+            q["createdAt"] = {"$gt": since}
+        count += await db.chat_messages.count_documents(q)
 
-    count = await db.chat_messages.count_documents({
-        "$or": channel_clause,
-        "userId": {"$ne": user_id},
-        "createdAt": {"$gt": since},
-    })
     return {"count": count}
 
 
-@router.post("/me/chat-read")
-async def mark_chat_read(user_id: str = Depends(get_current_user)):
-    """Called when the user opens a team chat — clears the unread badge."""
-    await db.users.update_one(
-        {"_id": ObjectId(user_id)},
-        # Stamp in IST wall-clock (naive) to match chat_messages.createdAt, so
-        # the unread count clears correctly right after reading.
-        {"$set": {"chatLastReadAt": now_ist_naive()}},
-    )
-    return {"ok": True}
+# `POST /me/chat-read` used to live here. It stamped a single
+# `users.chatLastReadAt`, which is what made reading office chat silently mark
+# every project chat read too. Unread is now per-channel in `chat_reads`, and
+# each channel is marked read by its own endpoint
+# (/chat/office|project|group/.../messages/read), so this endpoint wrote a
+# field nothing reads any more. Removed rather than left as a no-op, so no
+# future caller mistakes it for a working "clear the badge" call.
