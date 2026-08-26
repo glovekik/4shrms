@@ -65,6 +65,7 @@ def _serialize_task(t: dict) -> dict:
     return {
         "id": str(t["_id"]),
         "teamId": t.get("teamId"),
+        "projectId": t.get("projectId") or t.get("teamId"),
         "title": t.get("title"),
         "description": t.get("description", ""),
         "assigneeId": t.get("assigneeId"),
@@ -215,6 +216,10 @@ async def create_task(
 
     task = {
         "teamId": teamId,
+        # The Phase 1 migration kept the team's _id as the project's _id, so a
+        # team id IS the project id. Writing both keeps these tasks visible to
+        # the project views while the legacy team routes are still mounted.
+        "projectId": teamId,
         "title": data.title,
         "description": data.description or "",
         "assigneeId": data.assigneeId,

@@ -24,6 +24,7 @@ from utils.notify import create_notification, notify_user
 from utils.push import push_to_user
 from utils.ist import iso_naive
 from models.task import TaskCreate, TaskUpdate
+from utils import projects as projects_util
 
 
 router = APIRouter()
@@ -48,6 +49,7 @@ def _serialize_task(t: dict) -> dict:
     return {
         "id": str(t["_id"]),
         "teamId": t.get("teamId"),
+        "projectId": t.get("projectId"),
         "title": t.get("title"),
         "description": t.get("description", ""),
         "assigneeId": t.get("assigneeId"),
@@ -121,10 +123,14 @@ async def create_team_task(
                 "Assignee is not one of your direct reports",
             )
 
+    # Optional: when set, the project must exist and the assignee must be on it.
+    await projects_util.validate_task_project(data.projectId, data.assigneeId)
+
     now = datetime.now(timezone.utc)
     task = {
         # No teamId for manager-issued tasks — scope is reporter-based.
         "teamId": None,
+        "projectId": data.projectId,
         "title": data.title,
         "description": data.description or "",
         "assigneeId": data.assigneeId,
@@ -173,6 +179,10 @@ async def create_team_task(
 async def list_team_tasks(
     status: Optional[str] = Query(None),       # PENDING | ONGOING | COMPLETED
     assigneeId: Optional[str] = Query(None),
+    projectId: Optional[str] = Query(
+        None,
+        description="Filter to one project; 'none' for tasks with no project",
+    ),
     user: dict = Depends(get_current_user_doc),
 ):
     """Lists all tasks the manager has created OR whose assignee reports
@@ -183,6 +193,11 @@ async def list_team_tasks(
     query: dict = {}
     if status:
         query["status"] = status
+
+    if projectId == "none":
+        query["projectId"] = None
+    elif projectId:
+        query["projectId"] = projectId
 
     if user.get("role") == "MANAGER":
         report_ids = await _direct_report_ids(actor_id)
@@ -219,10 +234,15 @@ async def list_team_tasks(
                 "profilePictureUrl": u.get("profilePictureUrl"),
             }
 
+    project_map = await projects_util.brief_map(
+        t.get("projectId") for t in raw
+    )
+
     out: list[dict] = []
     for t in raw:
         serialized = _serialize_task(t)
         serialized["assignee"] = user_map.get(t.get("assigneeId"))
+        serialized["project"] = project_map.get(t.get("projectId"))
         out.append(serialized)
     return out
 
@@ -274,6 +294,17 @@ async def update_team_task(
         update["reminderIntervalMinutes"] = data.reminderIntervalMinutes
     if data.attachments is not None:
         update["attachments"] = data.attachments
+    if data.projectId is not None:
+        # "" clears the project; otherwise validate against the assignee the
+        # task will actually have once this update lands.
+        if data.projectId == "":
+            update["projectId"] = None
+        else:
+            await projects_util.validate_task_project(
+                data.projectId,
+                update.get("assigneeId") or task.get("assigneeId"),
+            )
+            update["projectId"] = data.projectId
 
     await db.tasks.update_one({"_id": oid}, {"$set": update})
 

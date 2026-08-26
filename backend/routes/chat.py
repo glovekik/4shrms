@@ -8,6 +8,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from database import db
+from utils import project_members as pm
 from utils.dependencies import get_current_user_doc
 from utils.ist import now_ist_naive, iso_naive, IST
 from utils.notify import notify_user
@@ -16,10 +17,12 @@ from utils.realtime import publish as realtime_publish
 from models.message import MessageCreate, MessageEdit
 from config import CHAT_EDIT_WINDOW_MINUTES, CHAT_DELETE_WINDOW_MINUTES
 
-# Two routers, one helper set. Office and team chat are structurally identical
+# Two routers, one helper set. Office and project chat are structurally identical
 # — `channelType` + `channelId` discriminate which channel a message belongs to.
 office_router = APIRouter()
-team_router = APIRouter()
+project_router = APIRouter()
+# Conversation list — the chat home screen.
+list_router = APIRouter()
 
 
 # ================= SERIALIZER =================
@@ -349,28 +352,59 @@ async def _insert_message(
                 except Exception:
                     pass
 
-    if channel_type == "team" and channel_id:
+    if channel_type == "group" and channel_id:
         try:
-            team = await db.teams.find_one({"_id": ObjectId(channel_id)})
+            group = await db.chat_groups.find_one({"_id": ObjectId(channel_id)})
         except (InvalidId, TypeError):
-            team = None
-        if team:
-            recipients = set(team.get("memberIds", []) or [])
-            if team.get("teamLeadId"):
-                recipients.add(team["teamLeadId"])
+            group = None
+        if group:
+            recipients = set(group.get("memberIds") or [])
             recipients.discard(user_id)
             recipients.difference_update(resolved_mentions)
             if recipients:
-                team_name = team.get("name") or "Team chat"
-                title = f"{author_name} · {team_name}"
-                team_data = {**chat_data, "channelName": team_name}
+                gname = group.get("name") or "Group chat"
+                try:
+                    await push_to_users(
+                        list(recipients),
+                        f"{author_name} · {gname}",
+                        snippet,
+                        {**chat_data, "channelName": gname},
+                        collapse_key=f"chat:group:{channel_id}",
+                        data_only_android=True,
+                    )
+                except Exception:
+                    pass
+                for rid in recipients:
+                    try:
+                        await realtime_publish(
+                            rid,
+                            {"type": "notification", "data": chat_data},
+                        )
+                    except Exception:
+                        pass
+
+    if channel_type == "project" and channel_id:
+        try:
+            project = await db.projects.find_one({"_id": ObjectId(channel_id)})
+        except (InvalidId, TypeError):
+            project = None
+        if project:
+            # Current members only — someone who left the project stops
+            # getting its chat notifications.
+            recipients = set(await pm.current_member_ids(channel_id))
+            recipients.discard(user_id)
+            recipients.difference_update(resolved_mentions)
+            if recipients:
+                project_name = project.get("name") or "Project chat"
+                title = f"{author_name} · {project_name}"
+                team_data = {**chat_data, "channelName": project_name}
                 try:
                     await push_to_users(
                         list(recipients),
                         title,
                         snippet,
                         team_data,
-                        collapse_key=f"chat:team:{channel_id}",
+                        collapse_key=f"chat:project:{channel_id}",
                         data_only_android=True,
                     )
                 except Exception:
@@ -500,31 +534,31 @@ async def _delete_message(
     return {"message": "Message deleted"}
 
 
-async def _ensure_team_chat_access(
-    team_id: str,
+async def _ensure_project_chat_access(
+    project_id: str,
     user: dict,
 ) -> dict:
-    """Caller must be HR, the team's TL, or in memberIds."""
+    """Caller must be HR/CEO or a current member of the project.
+
+    Access follows project membership, so someone removed from a project
+    loses the chat with it — and someone added gains it — without a separate
+    list to keep in step.
+    """
     try:
-        oid = ObjectId(team_id)
+        oid = ObjectId(project_id)
     except (InvalidId, TypeError):
-        raise HTTPException(400, "Invalid team id")
+        raise HTTPException(400, "Invalid project id")
 
-    team = await db.teams.find_one({"_id": oid})
+    project = await db.projects.find_one({"_id": oid})
 
-    if not team:
-        raise HTTPException(404, "Team not found")
+    if not project:
+        raise HTTPException(404, "Project not found")
 
-    user_id = str(user["_id"])
+    if user.get("role") in ("HR", "CEO"):
+        return project
 
-    if user.get("role") == "HR":
-        return team
-
-    if team.get("teamLeadId") == user_id:
-        return team
-
-    if user_id in team.get("memberIds", []):
-        return team
+    if await pm.is_project_member(str(user["_id"]), project_id):
+        return project
 
     raise HTTPException(
         403,
@@ -584,61 +618,144 @@ async def delete_office_message(
 
 
 # ================= TEAM CHAT =================
-@team_router.get("/{teamId}/messages")
-async def list_team_messages(
-    teamId: str,
+@project_router.get("/{projectId}/messages")
+async def list_project_messages(
+    projectId: str,
     before: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=100),
     user: dict = Depends(get_current_user_doc),
 ):
-    await _ensure_team_chat_access(teamId, user)
+    await _ensure_project_chat_access(projectId, user)
     return await _list_messages(
-        "team", teamId, before, limit, user,
+        "project", projectId, before, limit, user,
     )
 
 
-@team_router.post("/{teamId}/messages")
-async def post_team_message(
-    teamId: str,
+@project_router.post("/{projectId}/messages")
+async def post_project_message(
+    projectId: str,
     data: MessageCreate,
     user: dict = Depends(get_current_user_doc),
 ):
-    await _ensure_team_chat_access(teamId, user)
+    await _ensure_project_chat_access(projectId, user)
     return await _insert_message(
-        "team", teamId, data.text, data.mentions, user, data.attachments,
+        "project", projectId, data.text, data.mentions, user, data.attachments,
     )
 
 
-@team_router.post("/{teamId}/messages/read")
-async def read_team_messages(
-    teamId: str,
+@project_router.post("/{projectId}/messages/read")
+async def read_project_messages(
+    projectId: str,
     user: dict = Depends(get_current_user_doc),
 ):
-    await _ensure_team_chat_access(teamId, user)
-    return await _mark_read("team", teamId, user)
+    await _ensure_project_chat_access(projectId, user)
+    return await _mark_read("project", projectId, user)
 
 
-@team_router.put("/{teamId}/messages/{messageId}")
-async def edit_team_message(
-    teamId: str,
+@project_router.put("/{projectId}/messages/{messageId}")
+async def edit_project_message(
+    projectId: str,
     messageId: str,
     data: MessageEdit,
     user: dict = Depends(get_current_user_doc),
 ):
-    await _ensure_team_chat_access(teamId, user)
+    await _ensure_project_chat_access(projectId, user)
     return await _edit_message(
-        "team", teamId, messageId, data.text, data.mentions, user,
+        "project", projectId, messageId, data.text, data.mentions, user,
     )
 
 
-@team_router.delete("/{teamId}/messages/{messageId}")
-async def delete_team_message(
-    teamId: str,
+@project_router.delete("/{projectId}/messages/{messageId}")
+async def delete_project_message(
+    projectId: str,
     messageId: str,
     scope: str = Query("everyone"),
     user: dict = Depends(get_current_user_doc),
 ):
-    await _ensure_team_chat_access(teamId, user)
+    await _ensure_project_chat_access(projectId, user)
     return await _delete_message(
-        "team", teamId, messageId, user, scope,
+        "project", projectId, messageId, user, scope,
     )
+
+
+# ================= CONVERSATION LIST =================
+@list_router.get("/conversations")
+async def list_conversations(user: dict = Depends(get_current_user_doc)):
+    """Every chat the caller can open: office plus their current projects.
+
+    Unread is counted per channel from `chat_reads`, which already stores a
+    real per-channel pointer. The older `/me/chat-unread` badge used a single
+    `chatLastReadAt` on the user, so opening office chat silently marked
+    project chats read too.
+    """
+    user_id = str(user["_id"])
+
+    project_ids = await pm.project_ids_for_user(user_id)
+    channels: list[tuple[str, Optional[str], str]] = [("office", None, "Office chat")]
+
+    if project_ids:
+        oids = []
+        for pid in project_ids:
+            try:
+                oids.append(ObjectId(pid))
+            except (InvalidId, TypeError):
+                continue
+        async for p in db.projects.find(
+            {"_id": {"$in": oids}}, {"name": 1, "code": 1}
+        ):
+            channels.append(("project", str(p["_id"]), p.get("name") or "Project"))
+
+    # One read-pointer lookup for the whole list.
+    pointers: dict[tuple[str, Optional[str]], object] = {}
+    async for r in db.chat_reads.find({"userId": user_id}):
+        pointers[(r.get("channelType"), r.get("channelId"))] = r.get("lastReadAt")
+
+    async for g in db.chat_groups.find(
+        {"memberIds": user_id}, {"name": 1}
+    ).sort("name", 1):
+        channels.append(("group", str(g["_id"]), g.get("name") or "Group"))
+
+    out = []
+    for ctype, cid, name in channels:
+        q: dict = {"channelType": ctype}
+        q["channelId"] = cid
+        last = await db.chat_messages.find_one(q, sort=[("createdAt", -1)])
+
+        unread_q = {**q, "userId": {"$ne": user_id}}
+        since = pointers.get((ctype, cid))
+        if since is not None:
+            unread_q["createdAt"] = {"$gt": since}
+        unread = await db.chat_messages.count_documents(unread_q)
+
+        author = None
+        if last and last.get("userId"):
+            basics = await _get_user_basics([last["userId"]])
+            author = basics.get(last["userId"], {}).get("name")
+
+        out.append({
+            "channelType": ctype,
+            "channelId": cid,
+            "name": name,
+            "unread": unread,
+            "lastMessage": (
+                {
+                    "text": "" if last.get("deleted") else last.get("text", ""),
+                    "authorName": author,
+                    "authorId": last.get("userId"),
+                    "createdAt": iso_naive(last.get("createdAt")),
+                    "hasAttachments": bool(last.get("attachments")),
+                }
+                if last else None
+            ),
+        })
+
+    # Most recent conversation first; ones with no messages sink to the bottom
+    # but office chat stays pinned at the top.
+    office = [r for r in out if r["channelType"] == "office"]
+    others = sorted(
+        [r for r in out if r["channelType"] != "office"],
+        key=lambda r: (r["lastMessage"] or {}).get("createdAt") or "",
+        reverse=True,
+    )
+    rows = office + others
+    return {"conversations": rows, "totalUnread": sum(r["unread"] for r in rows)}

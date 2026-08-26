@@ -79,6 +79,39 @@ async def _working_days_in_range(start: str, end: str) -> set[str]:
     return days
 
 
+async def _leave_working_days(
+    user_ids: list[str], start: str, end: str, working_days: set[str]
+) -> float:
+    """Approved-leave days falling on working days, per the whole group.
+
+    Subtracted from the attendance denominator so sanctioned time off is
+    neither present nor expected. Counting it as absent meant someone on
+    approved leave for a month showed 0% attendance, which made the KPI
+    describe HR's own decisions rather than unplanned absence.
+
+    Half-days count 0.5: the employee worked the other half, and that half
+    already appears in the numerator.
+    """
+    if not working_days or not user_ids:
+        return 0.0
+    total = 0.0
+    async for r in db.attendance.find({
+        "userId": {"$in": user_ids},
+        "date": {"$gte": start, "$lte": end},
+        "$or": [
+            {"status": "ON_LEAVE"},
+            {"halfDay": True},
+        ],
+    }):
+        if r.get("date") not in working_days:
+            continue
+        if r.get("halfDay") or r.get("status") == "HALF_DAY":
+            total += 0.5
+        elif r.get("status") == "ON_LEAVE":
+            total += 1.0
+    return total
+
+
 async def _present_working_days(
     user_ids: list[str], start: str, end: str, working_days: set[str]
 ) -> float:
@@ -95,7 +128,14 @@ async def _present_working_days(
         "status": {"$in": PRESENT_STATUSES},
     }):
         if r.get("date") in working_days:
-            present += 0.5 if r.get("status") == "HALF_DAY" else 1.0
+            # Must mirror _leave_working_days exactly. Half-day leave taken on
+            # a day the employee also worked leaves `status` as COMPLETED and
+            # only sets `halfDay` (routes/leave.py annotates the real
+            # check-in rather than clobbering it). Crediting a full day here
+            # while the denominator excluded 0.5 scored that day at 200% and
+            # could push the whole KPI over 100%.
+            half = r.get("status") == "HALF_DAY" or r.get("halfDay")
+            present += 0.5 if half else 1.0
     return present
 
 
@@ -394,7 +434,13 @@ async def manager_dashboard(
     # 100% when absent days simply have no attendance row.
     month_start = now_ist_naive().replace(day=1).strftime("%Y-%m-%d")
     working_days = await _working_days_in_range(month_start, today)
-    denom_team = len(working_days) * len(report_ids)
+    # Approved leave is excluded from the denominator, not counted as absent.
+    leave_mtd_team = await _leave_working_days(
+        report_ids, month_start, today, working_days
+    )
+    denom_team = max(
+        0.0, len(working_days) * len(report_ids) - leave_mtd_team
+    )
     present_mtd = await _present_working_days(
         report_ids, month_start, today, working_days
     )
@@ -661,10 +707,16 @@ async def my_dashboard(
         }),
     )
 
-    # Personal attendance rate MTD (present working days / elapsed working days).
+    # Personal attendance rate MTD. Approved leave is removed from the
+    # denominator rather than counted as absent — otherwise a sanctioned
+    # month off reads as 0% attendance.
+    my_leave_mtd = await _leave_working_days(
+        [user_id], month_start, today, working_days
+    )
+    my_denom = max(0.0, len(working_days) - my_leave_mtd)
     attendance_rate_pct = (
-        round((my_mtd_present / len(working_days)) * 100, 1)
-        if working_days else None
+        round((my_mtd_present / my_denom) * 100, 1)
+        if my_denom > 0 else None
     )
     # On-time check-in rate MTD.
     on_time_checkin_pct = (

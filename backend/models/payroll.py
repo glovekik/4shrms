@@ -10,6 +10,10 @@ PayrollStatus = Literal["DRAFT", "PROCESSED", "LOCKED"]
 class SalaryStructureCreate(BaseModel):
     """All amounts are monthly, in INR (rupees)."""
 
+    # Backdating. Omit for "applies from today"; set it to correct a structure
+    # that was wrong for an earlier period, then re-run that month's payroll.
+    effectiveFrom: Optional[str] = None  # YYYY-MM-DD
+
     # Company-provided accommodation. Drives the HRA / Other Allowance
     # split: HRA only applies to someone paying their own rent, so when
     # accommodation is provided HRA is 0 and its share moves to Other

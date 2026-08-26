@@ -58,15 +58,27 @@ async def create_indexes():
         [("teamId", 1)],
     )
 
+    # Project board: every task on a project, and the status breakdown.
+    await db.tasks.create_index(
+        [("projectId", 1), ("status", 1)],
+    )
+
     # TEAMS: lookup by team lead
     await db.teams.create_index(
         [("teamLeadId", 1)],
     )
 
+    # PROJECT MEMBERSHIP: current roster, "my projects", point-in-time lookups
+    from utils.project_members import ensure_indexes as _project_member_indexes
+    await _project_member_indexes()
+
     # COMMENTS: thread per task, oldest first
     await db.comments.create_index(
         [("taskId", 1), ("createdAt", 1)],
     )
+
+    # CHAT GROUPS: "which groups am I in" runs on every chat-list load.
+    await db.chat_groups.create_index([("memberIds", 1)])
 
     # CHAT MESSAGES: latest-first per channel for paginated loads
     await db.chat_messages.create_index(
