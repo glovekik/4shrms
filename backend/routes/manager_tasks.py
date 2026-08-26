@@ -19,7 +19,7 @@ from typing import Optional
 
 from database import db
 from utils.ist import now_ist_naive
-from utils.dependencies import get_current_user_doc
+from utils.dependencies import get_current_user_doc, has_direct_reports
 from utils.notify import create_notification, notify_user
 from utils.push import push_to_user
 from utils.ist import iso_naive
@@ -30,9 +30,23 @@ from utils import projects as projects_util
 router = APIRouter()
 
 
-def _require_manager(user: dict) -> None:
-    if user.get("role") not in ("MANAGER", "HR"):
+async def _require_manager(user: dict) -> None:
+    """HR, or a manager who actually has direct reports.
+
+    Mirrors utils.dependencies.require_manager_or_hr — see the note there on
+    why the role alone isn't enough.
+    """
+    role = user.get("role")
+    if role == "HR":
+        return
+    if role != "MANAGER":
         raise HTTPException(403, "Manager or HR access required")
+    if not await has_direct_reports(str(user["_id"])):
+        raise HTTPException(
+            403,
+            "You don't have any direct reports, so there is nothing to "
+            "manage here. Ask HR if this looks wrong.",
+        )
 
 
 async def _direct_report_ids(manager_id: str) -> set[str]:
@@ -80,7 +94,7 @@ async def my_team(
     user: dict = Depends(get_current_user_doc),
 ):
     """Returns the manager's direct reports as User-shaped objects."""
-    _require_manager(user)
+    await _require_manager(user)
     actor_id = str(user["_id"])
 
     out: list[dict] = []
@@ -108,7 +122,7 @@ async def create_team_task(
     user: dict = Depends(get_current_user_doc),
 ):
     """Manager assigns a task to one of their direct reports."""
-    _require_manager(user)
+    await _require_manager(user)
     actor_id = str(user["_id"])
 
     if not data.assigneeId:
@@ -187,7 +201,7 @@ async def list_team_tasks(
 ):
     """Lists all tasks the manager has created OR whose assignee reports
     to them. HR sees every task. Filters by status / assignee."""
-    _require_manager(user)
+    await _require_manager(user)
     actor_id = str(user["_id"])
 
     query: dict = {}
@@ -253,7 +267,7 @@ async def update_team_task(
     data: TaskUpdate,
     user: dict = Depends(get_current_user_doc),
 ):
-    _require_manager(user)
+    await _require_manager(user)
     actor_id = str(user["_id"])
 
     try:
@@ -328,7 +342,7 @@ async def delete_team_task(
     id: str,
     user: dict = Depends(get_current_user_doc),
 ):
-    _require_manager(user)
+    await _require_manager(user)
     actor_id = str(user["_id"])
 
     try:
@@ -357,7 +371,7 @@ async def team_attendance(
 ):
     """Attendance for the manager's direct reports. Same shape as the HR
     listing but scoped to reports only (HR sees all)."""
-    _require_manager(user)
+    await _require_manager(user)
     actor_id = str(user["_id"])
 
     if user.get("role") == "MANAGER":
@@ -452,7 +466,7 @@ async def team_leave_balances(
     detail / work-performance view). HR may target anyone; a MANAGER may
     only target their own direct reports.
     """
-    _require_manager(user)
+    await _require_manager(user)
     actor_id = str(user["_id"])
 
     if userId:
@@ -546,7 +560,7 @@ async def team_client_locations(
     HR sees everyone; a MANAGER sees only their direct reports. Optional
     `userId` / `date` / `month` filters mirror the attendance listing.
     """
-    _require_manager(user)
+    await _require_manager(user)
     actor_id = str(user["_id"])
 
     query: dict = {"attendanceType": "CLIENT"}
