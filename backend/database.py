@@ -77,6 +77,12 @@ async def create_indexes():
         [("taskId", 1), ("createdAt", 1)],
     )
 
+    # PROJECT VARIABLES: listing per project, and the unique file name that
+    # stops two snippets sharing a name on the same project.
+    await db.project_variables.create_index(
+        [("projectId", 1), ("fileName", 1)], unique=True
+    )
+
     # CHAT GROUPS: "which groups am I in" runs on every chat-list load.
     await db.chat_groups.create_index([("memberIds", 1)])
 
