@@ -629,6 +629,15 @@ async def _decide_correction_internal(
         if final_notes is not None:
             att_updates["workNotes"] = final_notes
 
+        # Carry the employee's explanation onto the attendance row itself.
+        # It previously lived only on the correction request, so HR reviewing
+        # the attendance register could see a check-out time that had clearly
+        # been corrected with no way to tell why — they had to go and find the
+        # matching request. Stamped alongside who approved it and when.
+        att_updates["correctionReason"] = req.get("reason") or ""
+        att_updates["correctionApprovedBy"] = decider_id
+        att_updates["correctionApprovedAt"] = now_ist_naive()
+
         # Recompute status from the final check-in/out (use the existing
         # record values for whatever we're not changing). When both
         # timestamps are present run the same classify_on_checkout rules

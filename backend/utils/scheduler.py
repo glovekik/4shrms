@@ -80,7 +80,15 @@ async def auto_close_attendance() -> None:
                 "$set": {
                     "status": "COMPLETED",
                     "checkOut": check_out,
+                    # Gating flag — cleared once the employee files a
+                    # correction, so the app stops blocking their check-in.
                     "autoClosedByCron": True,
+                    # Permanent audit marker. `autoClosedByCron` is
+                    # deliberately cleared on approval, which used to erase
+                    # any trace that the day had been auto-closed at all —
+                    # HR reviewing the register saw a corrected time with no
+                    # indication of why it needed correcting.
+                    "wasAutoClosed": True,
                     "updatedAt": now_ist_naive(),
                 }
             },
