@@ -126,6 +126,10 @@ async def create_group(
         "name": name,
         "description": data.description or "",
         "memberIds": members,
+        # When each person gained access, so chat history can be floored per
+        # member. Someone added next month must not read this month's
+        # conversation — see routes/chat._history_floor.
+        "memberSince": {uid: now for uid in members},
         "createdBy": actor_id,
         "createdAt": now,
         "updatedAt": now,
@@ -194,6 +198,16 @@ async def update_group(
         members = await _validate_members(data.memberIds)
         added = set(members) - set(existing.get("memberIds") or [])
         update["memberIds"] = members
+        # Newcomers are stamped now; anyone already in keeps their original
+        # date, so re-saving the group doesn't reset everyone's history floor
+        # and hide messages they could already read.
+        since = dict(existing.get("memberSince") or {})
+        stamp = update["updatedAt"]
+        for uid in members:
+            since.setdefault(uid, stamp)
+        update["memberSince"] = {
+            uid: since[uid] for uid in members if uid in since
+        }
 
     await db.chat_groups.update_one({"_id": oid}, {"$set": update})
     await log_audit(

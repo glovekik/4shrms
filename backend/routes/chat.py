@@ -128,6 +128,72 @@ def _read_by_others(msg: dict, reads: dict) -> bool:
     return False
 
 
+async def _history_floor(
+    channel_type: str,
+    channel_id: Optional[str],
+    user: dict,
+) -> Optional[datetime]:
+    """Earliest message this user is entitled to see in this channel.
+
+    Account creation alone is the wrong floor for anything but office chat.
+    Someone whose account was made in May and who joined a project in August
+    could read three months of that project's conversation from before they
+    were on it — which is exactly what was happening.
+
+    The floor is therefore the LATER of two dates: when the account existed,
+    and when access to this particular conversation began.
+
+      office   — account creation. Everyone is in office chat from day one.
+      project  — the start of their CURRENT stay. Membership is date-ranged,
+                 so someone who left and rejoined sees from the rejoin; they
+                 had no access during the gap.
+      group    — when they were added (`memberSince`), falling back to the
+                 group's creation for groups predating that field.
+
+    Returns None only when nothing is known, which leaves the channel
+    unfiltered — the pre-existing behaviour for a user with no createdAt.
+    """
+    floors: list[datetime] = []
+
+    account = user.get("createdAt")
+    if isinstance(account, datetime):
+        floors.append(account)
+
+    user_id = str(user["_id"])
+
+    if channel_type == "project" and channel_id:
+        stay = await db.project_members.find_one(
+            {"projectId": channel_id, "userId": user_id, "leftAt": None},
+            sort=[("joinedAt", -1)],
+        )
+        joined = (stay or {}).get("joinedAt")
+        if isinstance(joined, str) and joined:
+            try:
+                # joinedAt is a YYYY-MM-DD wall-clock date; messages are IST
+                # naive datetimes, so midnight on that date is the boundary.
+                floors.append(
+                    datetime.fromisoformat(joined).replace(
+                        hour=0, minute=0, second=0, microsecond=0
+                    )
+                )
+            except ValueError:
+                pass
+
+    elif channel_type == "group" and channel_id:
+        try:
+            group = await db.chat_groups.find_one({"_id": ObjectId(channel_id)})
+        except (InvalidId, TypeError):
+            group = None
+        if group:
+            since = (group.get("memberSince") or {}).get(user_id)
+            if not isinstance(since, datetime):
+                since = group.get("createdAt")
+            if isinstance(since, datetime):
+                floors.append(since)
+
+    return max(floors) if floors else None
+
+
 async def _list_messages(
     channel_type: str,
     channel_id: Optional[str],
@@ -141,15 +207,20 @@ async def _list_messages(
         "channelId": channel_id,
         # Hide messages this user deleted just for themselves.
         "deletedFor": {"$ne": user_id},
+        # Deleted-for-everyone messages are gone, not tombstoned. The row is
+        # kept (deleted=True, text emptied) so an audit trail survives and the
+        # id stays resolvable, but it is never served to a reader — the UI
+        # used to render "🚫 This message was deleted" in its place, which
+        # tells everyone something was said and then withdrawn.
+        "deleted": {"$ne": True},
     }
 
-    # createdAt bounds: pagination cursor (< before) AND join-date floor
-    # (>= account creation) so a new member never sees pre-join history.
+    # createdAt bounds: pagination cursor (< before) AND the history floor.
     created_filter: dict = {}
     before_dt = _parse_before(before)
     if before_dt:
         created_filter["$lt"] = before_dt
-    floor = user.get("createdAt")
+    floor = await _history_floor(channel_type, channel_id, user)
     if floor:
         created_filter["$gte"] = floor
     if created_filter:
@@ -719,12 +790,24 @@ async def list_conversations(user: dict = Depends(get_current_user_doc)):
     for ctype, cid, name in channels:
         q: dict = {"channelType": ctype}
         q["channelId"] = cid
-        last = await db.chat_messages.find_one(q, sort=[("createdAt", -1)])
+        # The same floor the thread itself applies, or the list would preview
+        # and count messages the user can't open — a badge for history that
+        # isn't theirs, and a last-message snippet leaking its text.
+        floor = await _history_floor(ctype, cid, user)
+        if floor:
+            q["createdAt"] = {"$gte": floor}
+        # Deleted messages never surface, so the preview shows the newest
+        # message that still exists rather than an empty line.
+        last = await db.chat_messages.find_one(
+            {**q, "deleted": {"$ne": True}}, sort=[("createdAt", -1)]
+        )
 
-        unread_q = {**q, "userId": {"$ne": user_id}}
+        unread_q = {**q, "userId": {"$ne": user_id}, "deleted": {"$ne": True}}
         since = pointers.get((ctype, cid))
         if since is not None:
-            unread_q["createdAt"] = {"$gt": since}
+            unread_q["createdAt"] = {
+                **(q.get("createdAt") or {}), "$gt": since,
+            }
         unread = await db.chat_messages.count_documents(unread_q)
 
         author = None
@@ -739,7 +822,7 @@ async def list_conversations(user: dict = Depends(get_current_user_doc)):
             "unread": unread,
             "lastMessage": (
                 {
-                    "text": "" if last.get("deleted") else last.get("text", ""),
+                    "text": last.get("text", ""),
                     "authorName": author,
                     "authorId": last.get("userId"),
                     "createdAt": iso_naive(last.get("createdAt")),
