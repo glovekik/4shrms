@@ -412,7 +412,7 @@ def build_payslip_pdf(
     # (B) Employee-borne deductions.
     ded_defs = [
         ("PF (Employee)", "employeePF"),
-        ("ESI (Employee)", "employeeInsurance"),
+        ("Health Insurance (Employee)", "employeeInsurance"),
         ("Professional Tax", "professionalTax"),
         ("TDS", "tds"),
     ]
