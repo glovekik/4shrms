@@ -22,7 +22,7 @@ from utils.dependencies import (
     require_hr,
 )
 from utils.audit import log_audit
-from utils.email import send_notification_email
+from utils.email import send_event_email
 from utils.notify import notify_user
 from models.recruitment import (
     JobOpeningCreate, JobOpeningUpdate,
@@ -764,35 +764,37 @@ async def send_offer(
         {**offer, "_id": oid}
     )
     if OFFER_ACCEPT_URL_TEMPLATE and "{token}" in OFFER_ACCEPT_URL_TEMPLATE:
-        link = OFFER_ACCEPT_URL_TEMPLATE.replace("{token}", token)
-        link_line = f"\n\nAccept or decline online:\n{link}\n"
+        cta = (
+            "Accept or decline",
+            OFFER_ACCEPT_URL_TEMPLATE.replace("{token}", token),
+        )
+        token_row = None
     else:
-        link_line = (
-            f"\n\nReference token (for reply): {token}\n"
-        )
+        cta = None
+        token_row = token
 
-    body = (
-        f"Hi {candidate.get('name', 'there')},\n\n"
-        f"We're delighted to extend an offer for the {offer.get('position')} "
-        f"position at {COMPANY_NAME}.\n\n"
-        f"Annual CTC: {offer.get('annualCtc')}\n"
-        f"Proposed joining date: {offer.get('joiningDate')}\n"
-        + (
-            f"Valid until: {offer.get('validUntil')}\n"
-            if offer.get('validUntil') else ""
-        )
-        + (
-            f"\nNotes:\n{offer.get('notes')}\n"
-            if offer.get('notes') else ""
-        )
-        + link_line
-        + f"\nWe look forward to hearing from you.\n\n"
-        f"Regards,\n{COMPANY_NAME}"
-    )
-    await send_notification_email(
+    await send_event_email(
+        "offer_sent",
         candidate["email"],
-        f"Your offer from {COMPANY_NAME}",
-        body,
+        subject=f"Your offer from {COMPANY_NAME}",
+        headline=(
+            f"An offer for {offer.get('position')} at {COMPANY_NAME}"
+        ),
+        greeting=candidate.get("name"),
+        intro=(
+            "We're delighted to extend the following offer."
+        ),
+        rows=[
+            ("Position", offer.get("position")),
+            ("Annual CTC", offer.get("annualCtc")),
+            ("Joining date", offer.get("joiningDate")),
+            ("Valid until", offer.get("validUntil") or ""),
+            ("Notes", offer.get("notes") or ""),
+            ("Reference token", token_row),
+        ],
+        cta=cta,
+        outro="We look forward to hearing from you.",
+        meta={"offerId": str(oid), "candidateId": str(candidate["_id"])},
     )
 
     await log_audit(

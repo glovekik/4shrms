@@ -17,10 +17,14 @@ from utils.dependencies import (
     can_decide_for_employee,
 )
 from utils.push import push_to_user
-from utils.email import send_notification_email
+from utils.email import send_event_email, send_event_email_many
 from utils.audit import log_audit
-from utils.notify import create_notification, notify_approvers, notify_user
-from config import COMPANY_NAME
+from utils.notify import (
+    approver_recipients,
+    create_notification,
+    notify_approvers,
+    notify_user,
+)
 from models.leave import (
     LeaveTypeCreate,
     LeaveTypeUpdate,
@@ -188,23 +192,27 @@ async def _decide_leave_internal(
 
         name, email = await _lookup_user_email(req["userId"])
         if email:
-            note_line = (
-                f"\n\nNote from {actor_label}:\n{data.note}\n"
-                if data.note else ""
-            )
-            await send_notification_email(
+            await send_event_email(
+                "leave_decision",
                 email,
-                f"Leave approved — {req['fromDate']} to {req['toDate']}",
-                (
-                    f"Hi {name or 'there'},\n\n"
-                    f"Your leave request has been APPROVED.\n\n"
-                    f"From: {req['fromDate']}\n"
-                    f"To:   {req['toDate']}\n"
-                    f"Days: {total_days}\n"
-                    f"Type: {req.get('leaveTypeCode', '')}"
-                    + note_line
-                    + f"\n\nRegards,\n{COMPANY_NAME}"
+                subject=(
+                    f"Leave approved — {req['fromDate']} to {req['toDate']}"
                 ),
+                headline="Your leave request has been approved",
+                greeting=name,
+                rows=[
+                    ("From", req["fromDate"]),
+                    ("To", req["toDate"]),
+                    ("Days", total_days),
+                    ("Type", req.get("leaveTypeCode", "")),
+                    ("Approved by", actor_label),
+                ],
+                note=(
+                    f"Note from {actor_label}: {data.note}"
+                    if data.note else None
+                ),
+                cta=("View in the app", "/leaves"),
+                meta={"leaveRequestId": str(oid), "userId": req["userId"]},
             )
 
         await log_audit(
@@ -261,24 +269,25 @@ async def _decide_leave_internal(
 
     name, email = await _lookup_user_email(req["userId"])
     if email:
-        note_line = (
-            f"\n\nReason from {actor_label}:\n{data.note}\n"
-            if data.note else ""
-        )
-        await send_notification_email(
+        await send_event_email(
+            "leave_decision",
             email,
-            f"Leave rejected — {req['fromDate']} to {req['toDate']}",
-            (
-                f"Hi {name or 'there'},\n\n"
-                f"Your leave request has been REJECTED.\n\n"
-                f"From: {req['fromDate']}\n"
-                f"To:   {req['toDate']}\n"
-                f"Days: {total_days}\n"
-                f"Type: {req.get('leaveTypeCode', '')}"
-                + note_line
-                + "\n\nIf you have questions, contact your HR team.\n"
-                + f"\nRegards,\n{COMPANY_NAME}"
+            subject=f"Leave rejected — {req['fromDate']} to {req['toDate']}",
+            headline="Your leave request has been rejected",
+            greeting=name,
+            rows=[
+                ("From", req["fromDate"]),
+                ("To", req["toDate"]),
+                ("Days", total_days),
+                ("Type", req.get("leaveTypeCode", "")),
+                ("Decided by", actor_label),
+            ],
+            note=(
+                f"Reason from {actor_label}: {data.note}"
+                if data.note else None
             ),
+            outro="If you have questions, contact your HR team.",
+            meta={"leaveRequestId": str(oid), "userId": req["userId"]},
         )
 
     await log_audit(
@@ -893,6 +902,27 @@ async def create_leave_request(
         f"{who} requested {total_days}d {data.leaveTypeCode} "
         f"({data.fromDate} → {data.toDate})",
         {"leaveRequestId": str(result.inserted_id)},
+    )
+    await send_event_email_many(
+        "leave_request",
+        await approver_recipients(user_id),
+        subject=f"Leave request from {who}",
+        headline=f"{who} has requested leave",
+        intro="This is waiting for your decision.",
+        rows=[
+            ("Employee", who),
+            ("From", data.fromDate),
+            ("To", data.toDate),
+            ("Days", total_days),
+            ("Type", data.leaveTypeCode),
+            ("Reason", data.reason or ""),
+        ],
+        cta_for=lambda r: (
+            "Review the request",
+            "/leave-requests" if r.get("role") in ("HR", "CEO")
+            else "/manager-leaves",
+        ),
+        meta={"leaveRequestId": str(result.inserted_id)},
     )
 
     return _serialize_request(request_doc, None, leave_type)

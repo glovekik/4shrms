@@ -92,3 +92,93 @@ Confirm the built output contains `hrmsapi.4sightai.com` and not `localhost`.
 
 Restores `projects` and `teams` and drops every `project_members` row. Then
 redeploy the previous image.
+
+---
+
+## Email notifications
+
+### 1. Credentials — put these in the server `.env`
+
+```bash
+SMTP_HOST=                 # smtp.zoho.in | smtp.gmail.com | email-smtp.ap-south-1.amazonaws.com
+SMTP_PORT=587              # 587 STARTTLS, 465 implicit TLS (both handled)
+SMTP_USERNAME=             # usually the full mailbox address
+SMTP_PASSWORD=             # app password, never the account password
+SMTP_FROM=hrms@4sightai.com
+SMTP_USE_TLS=true          # ignored when SMTP_PORT=465
+
+EMAIL_FROM_NAME=4SightHub HR
+EMAIL_REPLY_TO=            # a monitored inbox — replies to automated mail reach a person
+APP_BASE_URL=https://hrms.4sightai.com   # buttons in emails need absolute URLs
+```
+
+Optional, with working defaults: `EMAIL_MAX_ATTEMPTS=3`,
+`EMAIL_RETRY_BACKOFF_SECONDS=5`, `EMAIL_LOG_TTL_DAYS=180`.
+
+### 2. Nothing sends until you say so
+
+`EMAIL_ENABLED_EVENTS` is an allow-list and **defaults to empty**. This is
+deliberate: fifteen code paths call the sender, and without the list, setting
+`SMTP_HOST` would switch all of them on at once — welcome mails, payslips,
+leave decisions, task assignments — with no chance to check deliverability on
+something low-stakes first.
+
+```bash
+# Start here. Both are things people actively wait for, and neither is noisy.
+EMAIL_ENABLED_EVENTS=password_reset,payslip_ready
+
+# Then widen once delivery is proven.
+EMAIL_ENABLED_EVENTS=password_reset,payslip_ready,account_created,leave_request,leave_decision,reimbursement_request,reimbursement_decision,auto_checkout,offer_sent,offer_response
+
+# Everything, including the tier-2 events.
+EMAIL_ENABLED_EVENTS=*
+```
+
+The startup log states which it is. If SMTP is configured and the list is
+empty it logs a **warning** naming the variable, because "configured and
+silent" is otherwise baffling.
+
+| Event | Goes to | Fires when |
+|---|---|---|
+| `password_reset` | the employee | Forgot-password requested |
+| `login_otp` | the employee | Login, only when `REQUIRE_LOGIN_OTP=true` |
+| `account_created` | the employee | HR creates an account (carries the setup link) |
+| `onboarding_welcome` | the employee | HR clicks Send welcome email |
+| `payslip_ready` | the employee | HR sends a payslip — PDF attached |
+| `leave_request` | manager + HR | Employee applies for leave |
+| `leave_decision` | the employee | Leave approved or rejected |
+| `reimbursement_request` | manager + HR | Claim submitted |
+| `reimbursement_decision` | the employee | Either approval stage decides |
+| `correction_decision` | the employee | Attendance correction decided |
+| `auto_checkout` | the employee | Cron closes a forgotten check-out at 00:01 |
+| `offer_sent` | the candidate | HR sends an offer |
+| `offer_response` | the HR who sent it | Candidate accepts or declines via the public link |
+| `task_assigned` | the assignee | A TL assigns a task |
+| `task_complete` | task watchers | A task is marked complete |
+
+Approver emails follow the same rule as the in-app notification — the
+reporting manager (if active) plus every active HR user — and each recipient's
+button points at the screen their role actually uses.
+
+### 3. Verify before switching events on
+
+```
+POST /hr/email/test      → sends to the calling HR user, waits, returns the config
+GET  /hr/email/log       → recent attempts; ?status=failed&event=payslip_ready
+```
+
+`/hr/email/test` deliberately ignores the allow-list — it answers "do these
+credentials work?", which is the question you ask *before* enabling anything.
+
+### 4. DNS
+
+Add **SPF** and **DKIM** for the sending domain before enabling `payslip_ready`.
+Without them payslips land in spam, and a payslip in spam becomes a support
+ticket. SES additionally needs domain verification and a sandbox exit (~24h)
+before it will send to unverified addresses.
+
+### 5. What is logged
+
+`email_log` records event, recipient, subject, status, attempt count and the
+server's error — never the message body, because these carry payslips and
+password codes. Rows expire after `EMAIL_LOG_TTL_DAYS`.

@@ -90,20 +90,14 @@ async def notify_user(
     await create_notification(user_id, type, title, body, payload)
 
 
-async def notify_approvers(
-    employee_id: str,
-    type: str,
-    title: str,
-    body: str,
-    data: Optional[dict] = None,
-) -> None:
-    """Notify an employee's approvers about a newly-submitted request.
+async def approver_ids(employee_id: str) -> set[str]:
+    """Who approves this employee's requests.
 
-    Recipients = the employee's reporting manager (if assigned) + every
-    active HR user, deduped, never including the submitter. Used by the
-    request/submit endpoints (leave, reimbursement, correction, manual
-    attendance, timesheet) so approvers actually learn there's something
-    pending. Best-effort: never raises.
+    The employee's reporting manager (if assigned and still active) plus
+    every active HR user, deduped, never the submitter themselves. Split out
+    of notify_approvers so the email layer resolves recipients by exactly
+    the same rule — an email that reaches someone the in-app notification
+    didn't, or vice versa, is a bug waiting to be reported as one.
     """
     recipient_ids: set[str] = set()
 
@@ -133,8 +127,49 @@ async def notify_approvers(
         print(f"[notify] approver HR lookup failed: {e}")
 
     recipient_ids.discard(str(employee_id))
+    return recipient_ids
 
-    for rid in recipient_ids:
+
+async def approver_recipients(employee_id: str) -> list[dict]:
+    """Approvers as {email, name, role, id}, skipping anyone with no address.
+
+    Role travels with the address because a manager and an HR user acting on
+    the same request open different screens — the app already encodes that
+    split in resolveNotificationRoute(), and an email button that lands on
+    the wrong one is worse than no button.
+    """
+    out: list[dict] = []
+    for rid in await approver_ids(employee_id):
+        try:
+            u = await db.users.find_one(
+                {"_id": ObjectId(rid)}, {"email": 1, "name": 1, "role": 1}
+            )
+        except Exception:
+            u = None
+        if u and u.get("email"):
+            out.append({
+                "id": str(u["_id"]),
+                "email": u["email"],
+                "name": u.get("name"),
+                "role": u.get("role"),
+            })
+    return out
+
+
+async def notify_approvers(
+    employee_id: str,
+    type: str,
+    title: str,
+    body: str,
+    data: Optional[dict] = None,
+) -> None:
+    """Notify an employee's approvers about a newly-submitted request.
+
+    Used by the request/submit endpoints (leave, reimbursement, correction,
+    manual attendance, timesheet) so approvers actually learn there's
+    something pending. Best-effort: never raises.
+    """
+    for rid in await approver_ids(employee_id):
         await notify_user(rid, type, title, body, data)
 
 

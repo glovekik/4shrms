@@ -15,8 +15,12 @@ from utils.dependencies import (
     get_current_user,
     require_hr,
 )
-from utils.email import send_email_with_pdf
-from config import COMPANY_NAME, is_email_configured
+from utils.email import send_event_email
+from config import (
+    COMPANY_NAME,
+    is_email_configured,
+    is_email_event_enabled,
+)
 from models.onboarding import (
     OnboardingCreate,
     DocumentUpload,
@@ -235,43 +239,38 @@ async def send_welcome_email(
             "Recipient user has no email address",
         )
 
-    subject = f"Welcome to {COMPANY_NAME}!"
-    body = (
-        f"Hi {user.get('name', 'there')},\n\n"
-        f"Welcome to {COMPANY_NAME}! We're glad to have you on board.\n\n"
-        "Your HR will reach out with onboarding details. In the meantime, "
-        "please log in to the HR app and complete your joining tasks "
-        "and document uploads.\n\n"
-        "If you have any questions, reach out to your HR contact.\n\n"
-        f"Regards,\n{COMPANY_NAME}"
+    # HR clicked a button and is waiting for the answer, so this one waits
+    # rather than queueing — and says plainly when the event is switched off,
+    # which otherwise looks identical to a delivery failure.
+    if not is_email_event_enabled("onboarding_welcome"):
+        raise HTTPException(
+            503,
+            "The 'onboarding_welcome' email is switched off. Add it to "
+            "EMAIL_ENABLED_EVENTS to send it.",
+        )
+
+    ok = await send_event_email(
+        "onboarding_welcome",
+        user["email"],
+        subject=f"Welcome to {COMPANY_NAME}!",
+        headline=f"Welcome to {COMPANY_NAME}",
+        greeting=user.get("name"),
+        intro="We're glad to have you on board.",
+        outro=(
+            "Your HR will reach out with onboarding details. In the "
+            "meantime, please log in and complete your joining tasks and "
+            "document uploads."
+        ),
+        cta=("Open your onboarding", "/my-onboarding"),
+        note="If you have any questions, reach out to your HR contact.",
+        meta={"userId": str(user_oid), "onboardingId": id},
+        wait=True,
     )
-
-    # send_email_with_pdf supports an empty attachment too — but we want a
-    # plain email here. Reuse by passing empty bytes is awkward; do it inline.
-    import asyncio
-    import smtplib
-    from email.mime.text import MIMEText
-    from config import (
-        SMTP_HOST, SMTP_PORT, SMTP_USERNAME,
-        SMTP_PASSWORD, SMTP_FROM, SMTP_USE_TLS,
-    )
-
-    def _send_plain():
-        msg = MIMEText(body, "plain")
-        msg["Subject"] = subject
-        msg["From"] = SMTP_FROM
-        msg["To"] = user["email"]
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as smtp:
-            if SMTP_USE_TLS:
-                smtp.starttls()
-            if SMTP_USERNAME:
-                smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
-            smtp.send_message(msg)
-
-    try:
-        await asyncio.to_thread(_send_plain)
-    except Exception as e:
-        raise HTTPException(502, f"Email send failed: {e}")
+    if not ok:
+        raise HTTPException(
+            502,
+            "Email send failed — see GET /hr/email/log for the reason.",
+        )
 
     now = datetime.now(timezone.utc)
     await db.onboardings.update_one(

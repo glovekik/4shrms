@@ -105,6 +105,76 @@ def is_email_configured() -> bool:
     return bool(SMTP_HOST and SMTP_FROM)
 
 
+# ================= EMAIL DELIVERY =================
+# Display name on the From header. "4SightHub HR <hrms@4sightai.com>" reads
+# better in an inbox than a bare address.
+EMAIL_FROM_NAME = os.getenv("EMAIL_FROM_NAME", "").strip() or COMPANY_NAME
+
+# Replies to an automated email should reach a person, not the send-only
+# mailbox. Empty means no Reply-To header at all.
+EMAIL_REPLY_TO = os.getenv("EMAIL_REPLY_TO", "").strip()
+
+# Absolute base for links inside emails — an email client has no notion of
+# the app's routing, so every button needs a full URL.
+APP_BASE_URL = os.getenv(
+    "APP_BASE_URL", "https://hrms.4sightai.com"
+).strip().rstrip("/")
+
+# Allow-list, comma-separated event names; "*" enables everything.
+#
+# This exists because eleven code paths already call the email sender. The
+# moment SMTP_HOST and SMTP_FROM are set they would ALL start sending at
+# once — welcome mails, payslips, leave decisions, task assignments — with
+# no chance to verify deliverability on something low-stakes first. So the
+# default is to send nothing, and events are switched on deliberately.
+#
+# The startup log names this variable when SMTP is configured but the list
+# is empty, because "email is set up and silent" is otherwise baffling.
+EMAIL_ENABLED_EVENTS = {
+    e.strip() for e in os.getenv("EMAIL_ENABLED_EVENTS", "").split(",")
+    if e.strip()
+}
+
+# Three attempts over ~35s. Enough to ride out a transient refusal without
+# holding a background task open for minutes.
+EMAIL_MAX_ATTEMPTS = int(os.getenv("EMAIL_MAX_ATTEMPTS", "3"))
+EMAIL_RETRY_BACKOFF_SECONDS = int(
+    os.getenv("EMAIL_RETRY_BACKOFF_SECONDS", "5")
+)
+
+# Delivery rows are an audit trail ("did payroll actually go out?"), not
+# permanent records. Six months covers any payroll dispute.
+EMAIL_LOG_TTL_DAYS = int(os.getenv("EMAIL_LOG_TTL_DAYS", "180"))
+
+
+def is_email_event_enabled(event: str) -> bool:
+    """Whether this specific event may send.
+
+    Separate from is_email_configured(): SMTP can be perfectly set up while
+    an event is still switched off during a staged rollout.
+    """
+    if not event:
+        return False
+    return "*" in EMAIL_ENABLED_EVENTS or event in EMAIL_ENABLED_EVENTS
+
+
+def email_status() -> dict:
+    """Human-readable email configuration, for /hr/email/test and startup."""
+    return {
+        "configured": is_email_configured(),
+        "host": SMTP_HOST or None,
+        "port": SMTP_PORT if SMTP_HOST else None,
+        "from": (
+            f"{EMAIL_FROM_NAME} <{SMTP_FROM}>" if SMTP_FROM else None
+        ),
+        "replyTo": EMAIL_REPLY_TO or None,
+        "enabledEvents": (
+            "*" if "*" in EMAIL_ENABLED_EVENTS
+            else sorted(EMAIL_ENABLED_EVENTS)
+        ),
+    }
+
+
 # ================= GEOFENCE =================
 def _opt_float(name: str):
     v = os.getenv(name)

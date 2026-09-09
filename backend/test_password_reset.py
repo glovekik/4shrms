@@ -112,13 +112,19 @@ fake_db = FakeDB()
 sent_emails: list[tuple[str, str, str]] = []
 
 
-async def fake_send_email(to: str, subject: str, body: str) -> bool:
-    sent_emails.append((to, subject, body))
+async def fake_send_email(event: str, to: str, **kwargs) -> bool:
+    """Stands in for utils.email.send_event_email.
+
+    Records the rendered code rather than a body string — the route now
+    passes structured rows to the template layer instead of an f-string.
+    """
+    rows = dict(kwargs.get("rows") or [])
+    sent_emails.append((to, kwargs.get("subject", ""), str(rows.get("Code"))))
     return True
 
 
 auth_module.db = fake_db
-auth_module.send_notification_email = fake_send_email
+auth_module.send_event_email = fake_send_email
 
 
 # ---------------------------------------------------------------------------

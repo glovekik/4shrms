@@ -30,7 +30,7 @@ from utils.dependencies import (
     get_current_user_doc,
 )
 
-from utils.email import send_notification_email
+from utils.email import send_event_email
 
 from config import (
     SECRET_KEY,
@@ -332,17 +332,16 @@ async def _issue_login_otp(user: dict) -> None:
         upsert=True,
     )
 
-    body = (
-        f"Hi {user.get('name', 'there')},\n\n"
-        f"Your {COMPANY_NAME} login code is: {code}\n\n"
-        f"This code expires in {OTP_TTL_MINUTES} minute(s). "
-        "If you didn't try to log in, ignore this email.\n\n"
-        f"Regards,\n{COMPANY_NAME}"
-    )
-    await send_notification_email(
+    await send_event_email(
+        "login_otp",
         user["email"],
-        f"{COMPANY_NAME} login code: {code}",
-        body,
+        subject=f"{COMPANY_NAME} login code: {code}",
+        headline="Your login code",
+        greeting=user.get("name"),
+        rows=[("Code", code)],
+        outro=f"This code expires in {OTP_TTL_MINUTES} minute(s).",
+        note="If you didn't try to log in, ignore this email.",
+        meta={"userId": str(user["_id"])},
     )
 
 
@@ -714,21 +713,21 @@ async def forgot_password(data: ForgotPasswordRequest):
         upsert=True,
     )
 
-    body_text = (
-        f"Hi {user.get('name', 'there')},\n\n"
-        f"Your {COMPANY_NAME} password reset code is: {code}\n\n"
-        f"Enter this code in the app to choose a new password. "
-        f"It expires in {PASSWORD_RESET_CODE_TTL_MINUTES} minute(s). "
-        "If you didn't request this, ignore this email.\n\n"
-        f"Regards,\n{COMPANY_NAME}"
-    )
-
-    # send_notification_email never raises — failure is logged but we still
-    # return the generic message so SMTP outages don't leak account state.
-    await send_notification_email(
+    # send_event_email never raises — failure is logged but we still return
+    # the generic message so SMTP outages don't leak account state.
+    await send_event_email(
+        "password_reset",
         user["email"],
-        f"{COMPANY_NAME} password reset code",
-        body_text,
+        subject=f"{COMPANY_NAME} password reset code",
+        headline="Your password reset code",
+        greeting=user.get("name"),
+        rows=[("Code", code)],
+        outro=(
+            "Enter this code in the app to choose a new password. It "
+            f"expires in {PASSWORD_RESET_CODE_TTL_MINUTES} minute(s)."
+        ),
+        note="If you didn't request this, ignore this email.",
+        meta={"userId": str(user["_id"])},
     )
 
     return generic

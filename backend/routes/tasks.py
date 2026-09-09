@@ -7,14 +7,13 @@ from datetime import datetime, timezone
 
 from typing import Optional
 
-from config import COMPANY_NAME
 from database import db
 from utils.ist import now_ist_naive, iso_naive
 from utils.dependencies import (
     get_current_user,
     get_current_user_doc,
 )
-from utils.email import send_notification_email
+from utils.email import send_event_email
 from utils.push import push_to_user
 from utils.notify import create_notification, notify_user
 from models.comment import CommentCreate
@@ -441,17 +440,18 @@ async def complete_task(
                 except (InvalidId, TypeError):
                     watcher = None
                 if watcher and watcher.get("email"):
-                    await send_notification_email(
+                    await send_event_email(
+                        "task_complete",
                         watcher["email"],
-                        f"Task completed: {task.get('title', '')}",
-                        (
-                            f"Hi {watcher.get('name', 'there')},\n\n"
-                            f"{actor_name} marked the following task complete"
-                            f"{where}:\n\n"
-                            f"Title: {task.get('title', '')}\n\n"
-                            f"Open the app to review.\n\n"
-                            f"Regards,\n{COMPANY_NAME}"
+                        subject=f"Task completed: {task.get('title', '')}",
+                        headline=f"{actor_name} completed a task{where}",
+                        greeting=watcher.get("name"),
+                        rows=[("Task", task.get("title", ""))],
+                        cta=(
+                            "Review the task",
+                            f"/tasks/{task['_id']}",
                         ),
+                        meta={"taskId": str(task["_id"])},
                     )
     except Exception:
         pass

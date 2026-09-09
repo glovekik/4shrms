@@ -20,6 +20,7 @@ from config import COMPANY_NAME
 from database import db
 from utils.ist import now_ist_naive
 from utils.audit import log_audit
+from utils.email import send_event_email
 from utils.notify import notify_user
 
 
@@ -268,16 +269,41 @@ async def _record_candidate_response(
         )
 
     # Notify the HR user who created the offer (if recoverable).
+    who = (candidate.get("name") if candidate else None) or "A candidate"
     actor_id = offer.get("createdBy")
     if actor_id:
         await notify_user(
             actor_id,
             "offer_response",
             f"Offer {outcome.lower()} by candidate",
-            (candidate.get("name") if candidate else "Candidate")
-            + f": {note or ''}",
+            f"{who}: {note or ''}",
             {"offerId": str(offer["_id"]), "outcome": outcome},
         )
+        # Email too: an offer response is time-critical and the HR user who
+        # sent it may not open the app for hours.
+        try:
+            hr_user = await db.users.find_one(
+                {"_id": ObjectId(str(actor_id))}, {"email": 1, "name": 1}
+            )
+        except Exception:
+            hr_user = None
+        if hr_user and hr_user.get("email"):
+            await send_event_email(
+                "offer_response",
+                hr_user["email"],
+                subject=f"Offer {outcome.lower()} — {who}",
+                headline=f"{who} {outcome.lower()} the offer",
+                greeting=hr_user.get("name"),
+                rows=[
+                    ("Candidate", who),
+                    ("Position", offer.get("position") or ""),
+                    ("Outcome", outcome),
+                    ("Responded at", now.isoformat(timespec="seconds")),
+                    ("Note", note or ""),
+                ],
+                cta=("Open offers", "/hr-offers"),
+                meta={"offerId": str(offer["_id"]), "outcome": outcome},
+            )
 
     await log_audit(
         actor_id=None,

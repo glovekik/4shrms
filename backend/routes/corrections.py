@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 
 from typing import Optional
 
-from config import COMPANY_NAME
 from database import db
 from utils.ist import now_ist_naive, iso_naive
 from utils.dependencies import (
@@ -19,7 +18,7 @@ from utils.dependencies import (
     require_manager_or_hr,
     can_decide_for_employee,
 )
-from utils.email import send_notification_email
+from utils.email import send_event_email
 from utils.push import push_to_user
 from utils.audit import log_audit
 from utils.notify import create_notification, notify_approvers
@@ -67,16 +66,15 @@ async def _notify_requester(
     if not u or not u.get("email"):
         return
 
-    note_line = f"\n\nNote from HR:\n{note}\n" if note else ""
-    await send_notification_email(
+    await send_event_email(
+        "correction_decision",
         u["email"],
-        f"Attendance correction {decision.lower()}",
-        (
-            f"Hi {u.get('name', 'there')},\n\n"
-            f"Your attendance correction request has been {decision}."
-            + note_line
-            + f"\n\nRegards,\n{COMPANY_NAME}"
-        ),
+        subject=f"Attendance correction {decision.lower()}",
+        headline=f"Your attendance correction was {decision.lower()}",
+        greeting=u.get("name"),
+        note=f"Note from HR: {note}" if note else None,
+        cta=("View your attendance", "/attendance"),
+        meta={"requestId": request_id, "userId": user_id},
     )
 
 # User-facing endpoints under /attendance/...

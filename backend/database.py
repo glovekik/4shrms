@@ -392,3 +392,14 @@ async def create_indexes():
     await db.leave_requests.create_index(
         [("userId", 1), ("status", 1), ("fromDate", 1), ("toDate", 1)]
     )
+
+    # ---- Email delivery log ---------------------------------------------
+    # HR's view is "newest first", optionally narrowed to failures or to one
+    # event during a staged rollout.
+    await db.email_log.create_index([("createdAt", -1)])
+    await db.email_log.create_index([("status", 1), ("createdAt", -1)])
+    await db.email_log.create_index([("event", 1), ("createdAt", -1)])
+    # Rows are an audit trail, not a permanent record — Mongo expires them
+    # on `expiresAt` (EMAIL_LOG_TTL_DAYS) so the collection can't grow
+    # without bound.
+    await db.email_log.create_index("expiresAt", expireAfterSeconds=0)

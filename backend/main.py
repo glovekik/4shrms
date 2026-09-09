@@ -186,6 +186,34 @@ from utils.scheduler import (
 app = FastAPI()
 
 
+def _log_email_status() -> None:
+    """Say plainly, at boot, whether email will actually send.
+
+    "SMTP is configured and nothing arrives" is the confusing state — it
+    happens whenever EMAIL_ENABLED_EVENTS is empty, which is the default —
+    so the log names the variable rather than staying silent.
+    """
+    log = logging.getLogger("api.email")
+    from config import email_status
+    st = email_status()
+    if not st["configured"]:
+        log.info("Email: OFF (SMTP_HOST / SMTP_FROM not set)")
+        return
+    events = st["enabledEvents"]
+    if not events:
+        log.warning(
+            "Email: SMTP is configured (%s) but EMAIL_ENABLED_EVENTS is "
+            "empty, so NOTHING will send. Set it to a comma-separated list "
+            "of events, or '*' for all.",
+            st["host"],
+        )
+        return
+    log.info(
+        "Email: ON via %s as %s — events: %s",
+        st["host"], st["from"], events,
+    )
+
+
 @app.on_event("startup")
 async def on_startup():
     await create_indexes()
@@ -193,6 +221,7 @@ async def on_startup():
     # so the first upload doesn't pay for a head/create round-trip.
     storage.ensure_bucket()
     start_scheduler()
+    _log_email_status()
 
 
 @app.on_event("shutdown")
