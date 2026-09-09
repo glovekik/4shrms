@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -93,7 +94,27 @@ COMPANY_LOGO_PATH = os.getenv(
 SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USERNAME = os.getenv("SMTP_USERNAME", "").strip()
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "").strip()
+
+
+def _smtp_password(raw: str) -> str:
+    """Accept a Google app password exactly as Google displays it.
+
+    Google shows app passwords as four groups of four ("abcd efgh ijkl
+    mnop"), but the spaces are presentation only — the real secret is the
+    16 characters. Pasting what you see is the obvious thing to do and
+    fails as "authentication failed", which sends people hunting for the
+    wrong problem.
+
+    Only that exact shape is de-spaced. Any other password is left alone,
+    because a space inside one may well be deliberate.
+    """
+    v = raw.strip()
+    if re.fullmatch(r"(?:[A-Za-z0-9]{4}\s+){3}[A-Za-z0-9]{4}", v):
+        return re.sub(r"\s+", "", v)
+    return v
+
+
+SMTP_PASSWORD = _smtp_password(os.getenv("SMTP_PASSWORD", ""))
 SMTP_FROM = os.getenv("SMTP_FROM", "").strip()
 SMTP_USE_TLS = (
     os.getenv("SMTP_USE_TLS", "true").lower() == "true"
