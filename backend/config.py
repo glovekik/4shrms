@@ -202,9 +202,15 @@ def is_geofence_configured() -> bool:
 
 # ================= ATTENDANCE POLICY =================
 # Defaults pulled from PRD sections 5 + 22. Tunable per company via .env.
+#
+# A check-in is late strictly after LATE_AFTER_HOUR:LATE_AFTER_MINUTE plus
+# GRACE_MINUTES. The two used to be 10:15 and 15, so the real cutoff was
+# 10:30 — a number that appeared nowhere in the config and surprised people
+# reading it. Grace now defaults to 0 so the configured time IS the cutoff:
+# 10:50, with anyone at or before that on time.
 LATE_AFTER_HOUR = int(os.getenv("LATE_AFTER_HOUR", "10"))
-LATE_AFTER_MINUTE = int(os.getenv("LATE_AFTER_MINUTE", "15"))
-GRACE_MINUTES = int(os.getenv("GRACE_MINUTES", "15"))
+LATE_AFTER_MINUTE = int(os.getenv("LATE_AFTER_MINUTE", "50"))
+GRACE_MINUTES = int(os.getenv("GRACE_MINUTES", "0"))
 HALF_DAY_MIN_HOURS = float(os.getenv("HALF_DAY_MIN_HOURS", "4.5"))
 OVERTIME_AFTER_HOURS = float(os.getenv("OVERTIME_AFTER_HOURS", "9"))
 # Comma-separated weekday numbers (Mon=0, Sun=6). Default Sat+Sun.
