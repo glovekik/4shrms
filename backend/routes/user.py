@@ -11,6 +11,9 @@ from typing import Optional
 
 from database import db
 from utils import project_members as pm
+# Shared with the chat routes so the badge and the thread can never
+# disagree about which history this user may see.
+from routes.chat import _history_floor
 from models.user import PersonalInfo, EmergencyContact
 from utils.audit import log_audit
 from utils.dependencies import get_current_user
@@ -351,10 +354,22 @@ async def my_chat_unread(user_id: str = Depends(get_current_user)):
             "channelType": ctype,
             "channelId": cid,
             "userId": {"$ne": user_id},
+            # A deleted message must not keep a badge lit.
+            "deleted": {"$ne": True},
         }
+        # Same history floor the thread applies, so the badge can never count
+        # messages from before this user joined the project or group. Without
+        # it, a member added today opens a "12 unread" badge onto an empty
+        # thread.
+        bounds: dict = {}
+        floor = await _history_floor(ctype, cid, user)
+        if floor:
+            bounds["$gte"] = floor
         since = pointers.get((ctype, cid))
         if since is not None:
-            q["createdAt"] = {"$gt": since}
+            bounds["$gt"] = since
+        if bounds:
+            q["createdAt"] = bounds
         count += await db.chat_messages.count_documents(q)
 
     return {"count": count}

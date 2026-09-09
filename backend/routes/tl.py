@@ -5,10 +5,9 @@ from bson.errors import InvalidId
 
 from datetime import datetime, timezone
 
-from config import COMPANY_NAME
 from database import db
 from utils.dependencies import get_current_user_doc
-from utils.email import send_notification_email
+from utils.email import send_event_email
 from utils.push import push_to_user
 from utils.notify import create_notification, notify_user
 from models.task import TaskCreate, TaskUpdate
@@ -268,24 +267,21 @@ async def create_task(
     except (InvalidId, TypeError):
         assignee = None
     if assignee and assignee.get("email"):
-        due_line = f"\nDue: {data.dueDate}\n" if data.dueDate else ""
-        desc_line = (
-            f"\nDescription:\n{data.description}\n"
-            if data.description else ""
-        )
-        await send_notification_email(
+        await send_event_email(
+            "task_assigned",
             assignee["email"],
-            f"New task: {data.title}",
-            (
-                f"Hi {assignee.get('name', 'there')},\n\n"
-                f"{user.get('name', 'Your TL')} assigned you a new task in "
-                f"team \"{team.get('name', '')}\":\n\n"
-                f"Title: {data.title}\n"
-                + due_line
-                + desc_line
-                + f"\nOpen the app to view and respond.\n"
-                + f"\nRegards,\n{COMPANY_NAME}"
-            ),
+            subject=f"New task: {data.title}",
+            headline=f"{user.get('name', 'Your TL')} assigned you a task",
+            greeting=assignee.get("name"),
+            rows=[
+                ("Task", data.title),
+                ("Team", team.get("name", "")),
+                ("Priority", data.priority or "MEDIUM"),
+                ("Due", data.dueDate or ""),
+                ("Details", data.description or ""),
+            ],
+            cta=("Open the task", f"/tasks/{result.inserted_id}"),
+            meta={"taskId": str(result.inserted_id)},
         )
 
     return {

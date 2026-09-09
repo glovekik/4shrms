@@ -30,6 +30,7 @@ from utils.payroll_calc import (
 )
 from utils.pdf import build_payslip_pdf, PAYSLIP_PDF_VERSION
 from utils.email import send_email_with_pdf
+from utils.email_templates import render
 from utils.push import push_to_users
 from utils.notify import create_notification
 from utils.audit import log_audit
@@ -1091,15 +1092,25 @@ def _default_subject(payslip: dict) -> str:
     )
 
 
-def _default_body(user: dict, payslip: dict) -> str:
-    name = user.get("name", "Team member")
-    return (
-        f"Hi {name},\n\n"
-        f"Please find attached your payslip for "
-        f"{month_name[payslip.get('month', 1)]} "
-        f"{payslip.get('year', '')}.\n\n"
-        f"Net pay: INR {payslip.get('netPay', 0):,.2f}\n\n"
-        f"Regards,\n{COMPANY_NAME}"
+def _default_body(user: dict, payslip: dict) -> tuple[str, str]:
+    """(html, text) for a payslip email — the PDF is the point, so the body
+    just confirms which month it covers and what the net pay was."""
+    period = (
+        f"{month_name[payslip.get('month', 1)]} {payslip.get('year', '')}"
+    )
+    return render(
+        headline=f"Your payslip for {period}",
+        greeting=user.get("name"),
+        intro="Your payslip is attached to this email as a PDF.",
+        rows=[
+            ("Period", period),
+            ("Net pay", f"INR {payslip.get('netPay', 0):,.2f}"),
+        ],
+        cta=("View in the app", "/my-payroll"),
+        note=(
+            "This document contains personal salary information. If it "
+            "reached you in error, please delete it and tell HR."
+        ),
     )
 
 
@@ -1212,13 +1223,16 @@ async def email_payslip(
 
     pdf_bytes = await _load_pdf_bytes(p)
 
+    body_html, body_text = _default_body(user, p)
     try:
         await send_email_with_pdf(
             to_email=user["email"],
             subject=_default_subject(p),
-            body=_default_body(user, p),
+            body=body_text,
+            html=body_html,
             pdf_bytes=pdf_bytes,
             pdf_filename=_pdf_filename_for(p, user),
+            meta={"payslipId": str(p["_id"]), "userId": str(p.get("userId"))},
         )
     except Exception as e:
         raise HTTPException(
@@ -1286,12 +1300,18 @@ async def email_all_payslips(
 
         try:
             pdf_bytes = await _load_pdf_bytes(p)
+            body_html, body_text = _default_body(user, p)
             await send_email_with_pdf(
                 to_email=user["email"],
                 subject=_default_subject(p),
-                body=_default_body(user, p),
+                body=body_text,
+                html=body_html,
                 pdf_bytes=pdf_bytes,
                 pdf_filename=_pdf_filename_for(p, user),
+                meta={
+                    "payslipId": str(p["_id"]),
+                    "userId": str(p.get("userId")),
+                },
             )
             now = datetime.now(timezone.utc)
             await db.payslips.update_one(

@@ -6,7 +6,10 @@ from apscheduler.schedulers.base import SchedulerNotRunningError
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
+from bson import ObjectId
+
 from database import db
+from utils.email import send_event_email
 from utils.attendance_rules import is_weekend
 from utils.ist import now_ist_naive
 
@@ -80,7 +83,15 @@ async def auto_close_attendance() -> None:
                 "$set": {
                     "status": "COMPLETED",
                     "checkOut": check_out,
+                    # Gating flag — cleared once the employee files a
+                    # correction, so the app stops blocking their check-in.
                     "autoClosedByCron": True,
+                    # Permanent audit marker. `autoClosedByCron` is
+                    # deliberately cleared on approval, which used to erase
+                    # any trace that the day had been auto-closed at all —
+                    # HR reviewing the register saw a corrected time with no
+                    # indication of why it needed correcting.
+                    "wasAutoClosed": True,
                     "updatedAt": now_ist_naive(),
                 }
             },
@@ -104,6 +115,39 @@ async def auto_close_attendance() -> None:
             )
         except Exception:
             pass
+
+        # Email as well as push: this one blocks the next morning's check-in
+        # until it is corrected, so someone who misses the notification finds
+        # out at the worst possible moment.
+        try:
+            emp = await db.users.find_one(
+                {"_id": ObjectId(str(uid))}, {"email": 1, "name": 1}
+            )
+            if emp and emp.get("email"):
+                await send_event_email(
+                    "auto_checkout",
+                    emp["email"],
+                    subject=f"You didn't check out on {d}",
+                    headline=f"Your {d} attendance was closed automatically",
+                    greeting=emp.get("name"),
+                    intro=(
+                        "You didn't check out, so we recorded a placeholder "
+                        "time. It is almost certainly wrong."
+                    ),
+                    rows=[
+                        ("Date", d),
+                        ("Recorded check-out", "11:59 PM (placeholder)"),
+                    ],
+                    outro=(
+                        "Send a correction request with the time you actually "
+                        "left and what you worked on. Both are required, and "
+                        "your check-in stays blocked until it is filed."
+                    ),
+                    cta=("File a correction", "/attendance"),
+                    meta={"userId": str(uid), "date": d},
+                )
+        except Exception as e:
+            print(f"[scheduler] auto_checkout email failed for {uid}: {e}")
 
     print(f"[scheduler] auto_close_attendance: closed {closed} record(s)")
 

@@ -1237,6 +1237,15 @@ async def hr_list_attendance(
             "workNotes": r.get("workNotes", ""),
             "unpaid": bool(r.get("unpaid", False)),
             "unpaidReason": r.get("unpaidReason"),
+            # Auto-checkout audit trail. Without these HR sees a corrected
+            # check-out time with no indication that the day was closed by the
+            # 00:01 cron, nor what the employee said about it.
+            "autoClosedByCron": bool(
+                r.get("wasAutoClosed") or r.get("autoClosedByCron")
+            ),
+            "correctionReason": r.get("correctionReason"),
+            "correctionApprovedAt": iso_naive(r.get("correctionApprovedAt")),
+            "halfDay": bool(r.get("halfDay", False)),
         })
 
     return out

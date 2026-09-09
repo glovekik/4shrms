@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from database import db
+from utils.email import send_event_email, send_event_email_many
 from utils.dependencies import (
     get_current_user,
     get_current_user_doc,
@@ -24,7 +25,11 @@ from utils.dependencies import (
     can_decide_for_employee,
 )
 from utils.audit import log_audit
-from utils.notify import notify_user, notify_approvers
+from utils.notify import (
+    approver_recipients,
+    notify_user,
+    notify_approvers,
+)
 from models.reimbursement import (
     ReimbursementCreate,
     ReimbursementDecision,
@@ -161,6 +166,27 @@ async def create_reimbursement(
         f"{who} submitted a {data.amount} claim: {doc['title']}",
         {"reimbursementId": str(result.inserted_id)},
     )
+    await send_event_email_many(
+        "reimbursement_request",
+        await approver_recipients(user_id),
+        subject=f"Reimbursement claim from {who}",
+        headline=f"{who} submitted a reimbursement claim",
+        intro="This is waiting for your decision.",
+        rows=[
+            ("Employee", who),
+            ("Claim", doc["title"]),
+            ("Amount", data.amount),
+            ("Category", data.category or ""),
+            ("Expense date", data.expenseDate or ""),
+            ("Details", data.description or ""),
+        ],
+        cta_for=lambda r: (
+            "Review the claim",
+            "/hr-reimbursements" if r.get("role") in ("HR", "CEO")
+            else "/manager-reimbursements",
+        ),
+        meta={"reimbursementId": str(result.inserted_id)},
+    )
 
     return _serialize(doc)
 
@@ -285,6 +311,16 @@ async def manager_decide_reimbursement(
         data.note or r.get("title", ""),
         {"requestId": id, "stage": "MANAGER", "outcome": data.action},
     )
+    await _email_claimant(
+        r,
+        stage="your manager",
+        outcome=data.action,
+        note=data.note,
+        next_step=(
+            "It now goes to HR for final approval."
+            if data.action == "APPROVE" else None
+        ),
+    )
     await log_audit(
         actor_id=actor_id,
         action=f"reimbursement.manager_{data.action.lower()}",
@@ -293,6 +329,58 @@ async def manager_decide_reimbursement(
     )
     return {"message": f"Reimbursement {data.action.lower()} by manager"}
 
+
+async def _email_claimant(
+    claim: dict,
+    *,
+    stage: str,
+    outcome: str,
+    note: Optional[str],
+    next_step: Optional[str],
+) -> None:
+    """Tell the employee what happened to their claim.
+
+    Both decision points send the same shape of email, differing only in who
+    decided and what happens next — a manager's approval forwards the claim
+    to HR rather than settling it, and saying "approved" without that
+    distinction reads as "the money is coming".
+    """
+    try:
+        emp = await db.users.find_one(
+            {"_id": ObjectId(claim["userId"])}, {"email": 1, "name": 1}
+        )
+    except (InvalidId, TypeError, KeyError):
+        emp = None
+    if not emp or not emp.get("email"):
+        return
+
+    approved = outcome == "APPROVE"
+    await send_event_email(
+        "reimbursement_decision",
+        emp["email"],
+        subject=(
+            f"Reimbursement {'approved' if approved else 'rejected'} "
+            f"— {claim.get('title', '')}"
+        ),
+        headline=(
+            f"{stage.capitalize()} {'approved' if approved else 'rejected'} "
+            "your reimbursement claim"
+        ),
+        greeting=emp.get("name"),
+        rows=[
+            ("Claim", claim.get("title", "")),
+            ("Amount", claim.get("amount", "")),
+            ("Category", claim.get("category") or ""),
+            ("Decided by", stage),
+        ],
+        note=f"Note from {stage}: {note}" if note else None,
+        outro=next_step,
+        cta=("View your claims", "/reimbursements"),
+        meta={
+            "reimbursementId": str(claim.get("_id")),
+            "userId": claim.get("userId"),
+        },
+    )
 
 # ================= HR: LIST + FINAL DECIDE =================
 @hr_router.get("")
@@ -417,6 +505,16 @@ async def hr_decide_reimbursement(
         title,
         data.note or r.get("title", ""),
         {"requestId": id, "stage": "HR", "outcome": data.action},
+    )
+    await _email_claimant(
+        r,
+        stage="HR",
+        outcome=data.action,
+        note=data.note,
+        next_step=(
+            "It will be paid out with your next cycle."
+            if data.action == "APPROVE" else None
+        ),
     )
     await log_audit(
         actor_id=hr_id,

@@ -17,11 +17,18 @@ from config import (
     PASSWORD_RESET_TTL_HOURS,
     PASSWORD_RESET_URL_TEMPLATE,
     is_email_configured,
+    email_status,
 )
 from database import db
 from utils.ist import now_ist_naive
 from utils.dependencies import require_hr, require_hr_or_ceo
-from utils.email import send_notification_email
+from utils.email import (
+    send_event_email,
+    _attempt_delivery,
+    _build,
+    _log_queued,
+)
+from utils.email_templates import render
 from utils.audit import log_audit
 from utils.notify import notify_user
 from models.user import HRCreateUser, HRSetPassword, HRUserUpdate
@@ -411,27 +418,38 @@ async def _send_welcome_email(
     })
 
     if PASSWORD_RESET_URL_TEMPLATE and "{token}" in PASSWORD_RESET_URL_TEMPLATE:
-        link = PASSWORD_RESET_URL_TEMPLATE.replace("{token}", token)
-        link_line = f"\n\nSet your password here:\n{link}\n"
+        cta = ("Set your password", PASSWORD_RESET_URL_TEMPLATE.replace(
+            "{token}", token
+        ))
+        token_row = None
     else:
-        link_line = (
-            f"\n\nSetup token: {token}\n"
-            "Open the app's password reset screen and paste this token "
-            "to set your password.\n"
-        )
+        # No deep-link template configured — the token still has to reach
+        # them, so show it and say where to paste it.
+        cta = None
+        token_row = token
 
-    body = (
-        f"Hi {name},\n\n"
-        f"An account has been created for you on {COMPANY_NAME}.\n\n"
-        f"Login email: {to_email}"
-        + link_line
-        + f"\nThis link/token expires in {PASSWORD_RESET_TTL_HOURS} hour(s). "
-        "If it expires, ask HR to resend it or use the 'Forgot password' "
-        "flow on the login screen.\n\n"
-        f"Welcome aboard,\n{COMPANY_NAME}"
+    await send_event_email(
+        "account_created",
+        to_email,
+        subject=f"Welcome to {COMPANY_NAME}",
+        headline=f"An account has been created for you on {COMPANY_NAME}",
+        greeting=name,
+        rows=[
+            ("Login email", to_email),
+            ("Setup token", token_row),
+        ],
+        cta=cta,
+        outro=(
+            "Open the app's password reset screen and paste this token to "
+            "set your password."
+            if token_row else None
+        ),
+        note=(
+            f"This expires in {PASSWORD_RESET_TTL_HOURS} hour(s). If it does, "
+            "ask HR to resend it or use 'Forgot password' on the login screen."
+        ),
+        meta={"userId": str(user_oid)},
     )
-
-    await send_notification_email(to_email, f"Welcome to {COMPANY_NAME}", body)
 
 
 @router.get("/users")
@@ -882,23 +900,110 @@ async def email_test(
         )
 
     now = datetime.now(timezone.utc)
-    body = (
-        f"Hi {hr.get('name', 'there')},\n\n"
-        f"This is a test email from {COMPANY_NAME}.\n"
-        f"If you received it, SMTP delivery is working.\n\n"
-        f"Sent at: {now.isoformat()}\n"
-    )
+    st = email_status()
 
-    sent = await send_notification_email(
-        to_email,
-        f"{COMPANY_NAME} SMTP test",
-        body,
+    # Deliberately waits, and deliberately ignores EMAIL_ENABLED_EVENTS.
+    # This endpoint exists to answer "do these credentials work?", which is
+    # the question you ask *before* switching any real event on — gating it
+    # behind the allow-list would make it useless for that.
+    html, text = render(
+        headline=f"SMTP delivery is working",
+        greeting=hr.get("name"),
+        intro=f"This is a test email from {COMPANY_NAME}.",
+        rows=[
+            ("Sent at", now.isoformat(timespec="seconds")),
+            ("Host", st["host"]),
+            ("From", st["from"]),
+            ("Reply-to", st["replyTo"]),
+            (
+                "Enabled events",
+                # A bare list renders as Python repr in the email body.
+                (", ".join(st["enabledEvents"]) or "none yet")
+                if isinstance(st["enabledEvents"], list)
+                else st["enabledEvents"],
+            ),
+        ],
     )
+    msg = _build(to_email, f"{COMPANY_NAME} SMTP test", text, html)
+    log_id = await _log_queued("smtp_test", to_email, "SMTP test", None)
+    ok = await _attempt_delivery(msg, log_id, label=f"smtp_test → {to_email}")
 
-    if not sent:
+    if not ok:
         raise HTTPException(
             status_code=502,
-            detail="SMTP delivery failed — check backend logs",
+            detail=(
+                "SMTP delivery failed — see GET /hr/email/log for the "
+                "reason the server gave."
+            ),
         )
 
-    return {"message": f"Test email sent to {to_email}"}
+    return {
+        "message": f"Test email sent to {to_email}",
+        "config": st,
+    }
+
+
+@router.get("/email/log")
+async def email_log(
+    status: Optional[str] = Query(None, description="queued|sent|failed"),
+    event: Optional[str] = Query(None),
+    limit: int = Query(100, le=500),
+    _hr: dict = Depends(require_hr),
+):
+    """Recent delivery attempts, newest first.
+
+    The point of this is answering "did it actually arrive?" without SSH
+    access to the server logs — particularly for payslips, where the
+    employee asking is a real support case.
+    """
+    q: dict = {}
+    if status:
+        q["status"] = status
+    if event:
+        q["event"] = event
+
+    out = []
+    async for row in db.email_log.find(q).sort("createdAt", -1).limit(limit):
+        out.append({
+            "id": str(row["_id"]),
+            "event": row.get("event"),
+            "to": row.get("to"),
+            "subject": row.get("subject"),
+            "status": row.get("status"),
+            "attempts": row.get("attempts", 0),
+            "error": row.get("error"),
+            "createdAt": (
+                row["createdAt"].isoformat() if row.get("createdAt") else None
+            ),
+            "sentAt": (
+                row["sentAt"].isoformat() if row.get("sentAt") else None
+            ),
+        })
+    return {"entries": out, "config": email_status()}
+
+
+@router.post("/email/log/{id}/resend")
+async def email_log_resend(
+    id: str,
+    _hr: dict = Depends(require_hr),
+):
+    """Resend a failed email.
+
+    Only the envelope is stored, never the rendered body — so this cannot
+    replay the original message. It tells HR what to re-trigger instead,
+    which is honest about what the log can and can't do.
+    """
+    try:
+        row = await db.email_log.find_one({"_id": ObjectId(id)})
+    except (InvalidId, TypeError):
+        raise HTTPException(400, "Invalid id")
+    if not row:
+        raise HTTPException(404, "Not found")
+    raise HTTPException(
+        400,
+        (
+            f"This entry ({row.get('event')} to {row.get('to')}) can't be "
+            "replayed — the message body isn't stored. Re-run the action "
+            "that sends it, for example re-sending the payslip."
+        ),
+    )
