@@ -213,6 +213,13 @@ OFFICE_RADIUS_METERS = float(
     os.getenv("OFFICE_RADIUS_METERS", "200")
 )
 
+# How much of a device's own reported accuracy the geofence forgives.
+# Mirrors ACCURACY_ALLOWANCE in the app's src/utils/location.ts — the two
+# must agree, or a check-in the app accepts gets refused by the server.
+GEOFENCE_ACCURACY_ALLOWANCE = float(
+    os.getenv("GEOFENCE_ACCURACY_ALLOWANCE", "150")
+)
+
 
 def is_geofence_configured() -> bool:
     return (

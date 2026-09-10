@@ -29,6 +29,11 @@ class AttendanceCheckIn(BaseModel):
     # site coordinates. Ignored for WFH.
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    # Radius of uncertainty in metres, as reported by the device. A browser
+    # on a laptop gives a point plus this circle, not a pin — the geofence
+    # check below forgives part of it so someone at their desk with a 120m
+    # fix isn't told they're too far away. Absent on older clients.
+    accuracy: Optional[float] = None
     # A best-effort reverse-geocoded address, stored for CLIENT check-ins so
     # HR / managers can see where the person is working from.
     clientAddress: Optional[str] = None

@@ -34,6 +34,7 @@ from config import (
     OFFICE_LATITUDE,
     OFFICE_LONGITUDE,
     OFFICE_RADIUS_METERS,
+    GEOFENCE_ACCURACY_ALLOWANCE,
     is_geofence_configured,
 )
 
@@ -195,7 +196,15 @@ async def checkin(
                 data.latitude,
                 data.longitude,
             )
-            if distance > OFFICE_RADIUS_METERS:
+            # Forgive the device's own reported uncertainty, capped, matching
+            # the client rule in src/utils/location.ts. A laptop's WiFi fix is
+            # a circle, and one straddling the boundary is the usual reason
+            # someone at their desk is refused; an uncapped allowance would
+            # instead let a vague fix in from anywhere.
+            allowance = min(
+                max(data.accuracy or 0.0, 0.0), GEOFENCE_ACCURACY_ALLOWANCE
+            )
+            if distance - allowance > OFFICE_RADIUS_METERS:
                 raise HTTPException(
                     400,
                     f"Too far from office "
