@@ -65,6 +65,19 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 # (db.refresh_tokens) so it can be revoked on logout / compromise.
 REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "30"))
 
+# Grace period during which a just-rotated refresh token still works.
+#
+# Rotation burns the old token the moment it is exchanged. If the response
+# never reaches the client — a dropped mobile connection, the app killed
+# mid-request — the client keeps a token the server has already destroyed,
+# and the next launch logs them out with a perfectly valid 30-day session.
+# Inside this window the old token replays to the SAME successor instead,
+# so a lost response costs a retry rather than the session. Outside it, a
+# second use is treated as replay and rejected.
+REFRESH_ROTATION_GRACE_SECONDS = int(
+    os.getenv("REFRESH_ROTATION_GRACE_SECONDS", "60")
+)
+
 
 
 # ================= COMPANY (used in payslip PDFs / emails) =================

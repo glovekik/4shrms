@@ -37,6 +37,7 @@ from config import (
     ALGORITHM,
     ACCESS_TOKEN_EXPIRE_MINUTES,
     REFRESH_TOKEN_EXPIRE_DAYS,
+    REFRESH_ROTATION_GRACE_SECONDS,
     COMPANY_NAME,
     REQUIRE_LOGIN_OTP,
     OTP_TTL_MINUTES,
@@ -437,9 +438,53 @@ async def refresh(data: RefreshRequest):
         await db.refresh_tokens.delete_one({"_id": record["_id"]})
         raise HTTPException(403, "This account is no longer active.")
 
-    # Rotate: burn the used token, then mint a brand-new access + refresh pair.
-    await db.refresh_tokens.delete_one({"_id": record["_id"]})
-    return await _build_auth_response(user)
+    # Already rotated once. Either the client never received the successor
+    # (dropped connection, app killed mid-request) and is retrying, or this
+    # is a replay of a burnt token.
+    successor = record.get("replacedBy")
+    if successor:
+        rotated_at = record.get("rotatedAt")
+        if rotated_at and rotated_at.tzinfo is None:
+            rotated_at = rotated_at.replace(tzinfo=timezone.utc)
+        within_grace = (
+            rotated_at is not None
+            and (now - rotated_at).total_seconds()
+            <= REFRESH_ROTATION_GRACE_SECONDS
+        )
+        live = await db.refresh_tokens.find_one({"token": successor})
+        if within_grace and live:
+            # Hand back the same successor rather than minting another, so a
+            # retry converges on one session instead of forking a new chain
+            # on every attempt.
+            return {
+                "access_token": create_access_token({"sub": str(user["_id"])}),
+                "token_type": "bearer",
+                "refresh_token": successor,
+            }
+        # Outside the window, or the successor is gone: treat as replay.
+        await db.refresh_tokens.delete_one({"_id": record["_id"]})
+        raise HTTPException(401, "Invalid or expired session")
+
+    # Rotate. The old token isn't deleted outright: it's marked as superseded
+    # and kept alive for the grace window, so the one request that matters —
+    # the retry after a lost response — still works. The TTL index on
+    # expiresAt sweeps it up afterwards without a cleanup job.
+    new_refresh = await _issue_refresh_token(str(user["_id"]))
+    await db.refresh_tokens.update_one(
+        {"_id": record["_id"]},
+        {"$set": {
+            "replacedBy": new_refresh,
+            "rotatedAt": now,
+            "expiresAt": now + timedelta(
+                seconds=REFRESH_ROTATION_GRACE_SECONDS
+            ),
+        }},
+    )
+    return {
+        "access_token": create_access_token({"sub": str(user["_id"])}),
+        "token_type": "bearer",
+        "refresh_token": new_refresh,
+    }
 
 
 @router.post("/logout")
