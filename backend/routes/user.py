@@ -16,6 +16,7 @@ from utils import project_members as pm
 from routes.chat import _history_floor
 from models.user import PersonalInfo, EmergencyContact
 from utils.audit import log_audit
+from utils import value_sets
 from utils.dependencies import get_current_user
 
 router = APIRouter()
@@ -248,6 +249,30 @@ async def update_my_profile(
         raise HTTPException(404, "User not found")
 
     incoming = data.model_dump(exclude_none=True)
+
+    # Controlled fields are canonicalised before they're stored, so "o+" and
+    # "FEMALE" land as "O+" and "Female" instead of adding yet another
+    # spelling. Anything that can't be mapped confidently is refused with the
+    # valid options named — a blood group is on an ID card for emergencies
+    # and is not a field to guess at.
+    #
+    # Only values being written are checked: _fill_blanks below ignores
+    # fields that already hold something, so an existing odd value can never
+    # block someone from saving the rest of their profile.
+    try:
+        for section, fields in (
+            ("personal", ("bloodGroup", "gender", "maritalStatus")),
+            ("emergencyContact", ("relationship",)),
+        ):
+            block = incoming.get(section)
+            if not isinstance(block, dict):
+                continue
+            for field in fields:
+                if field in block:
+                    block[field] = value_sets.normalize(field, block[field])
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
     updates: dict = {}
     if incoming.get("personal"):
         updates.update(
@@ -278,6 +303,20 @@ async def update_my_profile(
 
     fresh = await db.users.find_one({"_id": ObjectId(user_id)})
     return {**_serialize_profile(fresh), "updatedFields": changed}
+
+
+# ================= Value sets =================
+@router.get("/meta/value-sets")
+async def meta_value_sets():
+    """The controlled vocabularies the API validates against.
+
+    Served so a client renders the options it will actually be judged by.
+    Keeping a second copy in the app is how "Other" ends up offered on one
+    screen and refused by the server on save.
+
+    Unauthenticated on purpose: it's a list of blood groups, not data.
+    """
+    return value_sets.all_sets()
 
 
 # ================= Profile picture — every user can set their own =================
