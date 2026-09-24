@@ -34,6 +34,7 @@ from config import (
     OFFICE_LATITUDE,
     OFFICE_LONGITUDE,
     OFFICE_RADIUS_METERS,
+    REQUIRED_DAY_HOURS,
     GEOFENCE_ACCURACY_ALLOWANCE,
     is_geofence_configured,
 )
@@ -550,6 +551,15 @@ async def get_today(
         "checkIn": iso_naive(record.get("checkIn")),
 
         "checkOut": iso_naive(record.get("checkOut")),
+
+        # A full day is REQUIRED_DAY_HOURS from this person's own check-in.
+        # Sent as both the policy and the resolved instant so the client
+        # never hardcodes the number or recomputes the arithmetic.
+        "requiredHours": REQUIRED_DAY_HOURS,
+
+        "expectedCheckOut": iso_naive(
+            record["checkIn"] + timedelta(hours=REQUIRED_DAY_HOURS)
+        ) if record.get("checkIn") else None,
 
         "workNotes":
         record.get(
