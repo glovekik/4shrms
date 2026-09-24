@@ -186,6 +186,33 @@ from utils.scheduler import (
 app = FastAPI()
 
 
+def _log_push_status() -> None:
+    """Say at boot whether push can actually reach Android devices.
+
+    Expo-relay tokens need no credentials, but a standalone Android build
+    registers a NATIVE FCM token, and those go nowhere without a service
+    account. The failure is silent per-send — utils/fcm logs one line and
+    returns None — so a deploy that lost FCM_SERVICE_ACCOUNT_JSON looks
+    exactly like a deploy where nobody happens to be pushing. Say it once,
+    loudly, at startup instead.
+    """
+    log = logging.getLogger("api.push")
+    import os
+    configured = bool(
+        os.getenv("FCM_SERVICE_ACCOUNT_JSON", "").strip()
+        or os.getenv("FCM_SERVICE_ACCOUNT_FILE", "").strip()
+    )
+    if configured:
+        log.info("Push: FCM configured; Expo relay also active")
+    else:
+        log.warning(
+            "Push: FCM is NOT configured (FCM_SERVICE_ACCOUNT_JSON / "
+            "FCM_SERVICE_ACCOUNT_FILE unset). Expo-relay tokens still work, "
+            "but native Android tokens — which is what a standalone build "
+            "registers — will receive NOTHING."
+        )
+
+
 def _log_email_status() -> None:
     """Say plainly, at boot, whether email will actually send.
 
@@ -222,6 +249,7 @@ async def on_startup():
     storage.ensure_bucket()
     start_scheduler()
     _log_email_status()
+    _log_push_status()
 
 
 @app.on_event("shutdown")

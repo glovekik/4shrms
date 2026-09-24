@@ -522,6 +522,115 @@ async def submit_timesheet(
     return _serialize(saved)
 
 
+@user_router.post("/my/draft")
+async def save_draft(
+    data: TimesheetSubmit,
+    user_id: str = Depends(get_current_user),
+):
+    """Save a week in progress without submitting it.
+
+    Filling a timesheet is not a single sitting — people enter Monday on
+    Monday. Until this existed the only way to persist anything was /submit,
+    which demands every field on every working day and sends the week to a
+    manager. So edits lived in the screen's memory and any reload silently
+    threw them away.
+
+    Deliberately permissive where submit is strict: a half-filled day is the
+    normal state of a draft, so completeness isn't checked and no manager is
+    required. The guards that remain are the ones that protect real records —
+    you can't overwrite a week that is already with a manager or approved,
+    and you can't log time for a day that hasn't happened.
+    """
+    dates = _week_dates(data.weekStart)
+
+    existing = await db.timesheets.find_one({
+        "userId": user_id, "weekStart": data.weekStart,
+    })
+    if existing and existing.get("status") not in ("DRAFT", "REJECTED"):
+        raise HTTPException(
+            400,
+            f"This week is {existing.get('status')}. "
+            + (
+                "Withdraw it first if you need to change it."
+                if existing.get("status") == "PENDING"
+                else "It's already approved — raise an attendance correction."
+            ),
+        )
+
+    entries = []
+    for e in (data.entries or []):
+        if e.date not in dates:
+            raise HTTPException(400, f"entry date {e.date} not in this week")
+        entries.append({
+            "date": e.date,
+            "checkIn": e.checkIn,
+            "checkOut": e.checkOut,
+            "attendanceType": (e.attendanceType or "OFFICE").upper()
+            if (e.checkIn or e.checkOut) else e.attendanceType,
+            "projectId": e.projectId,
+            "notes": (e.notes or "").strip(),
+            "billable": bool(e.billable),
+        })
+
+    sent = {e["date"] for e in entries}
+    for d in dates:
+        if d not in sent:
+            entries.append({
+                "date": d, "checkIn": None, "checkOut": None,
+                "attendanceType": None, "projectId": None,
+                "notes": "", "billable": False,
+            })
+    entries.sort(key=lambda e: e["date"])
+
+    today = today_ist_str()
+    ahead = [
+        e["date"] for e in entries
+        if e["date"] > today
+        and (e.get("checkIn") or e.get("checkOut") or (e.get("notes") or "").strip())
+    ]
+    if ahead:
+        raise HTTPException(
+            400,
+            "You can't log time for a day that hasn't happened yet: "
+            + ", ".join(sorted(ahead)),
+        )
+
+    # Hours are derived here too, so the saved draft totals the same way the
+    # submitted week will. A reversed or half-filled day simply scores 0
+    # rather than being rejected.
+    total = 0.0
+    for e in entries:
+        e["hours"] = max(0.0, _hours_for(e))
+        total += e["hours"]
+
+    now = now_ist_naive()
+    doc = {
+        "userId": user_id,
+        "weekStart": data.weekStart,
+        "entries": entries,
+        "totalHours": round(total, 2),
+        "note": data.note or "",
+        "status": "DRAFT",
+        "createdAt": (existing or {}).get("createdAt") or now,
+        "updatedAt": now,
+    }
+
+    if existing:
+        await db.timesheets.update_one({"_id": existing["_id"]}, {"$set": doc})
+        record_id = existing["_id"]
+    else:
+        # A draft has no approver yet — submit resolves and records one.
+        doc.update({
+            "approverId": None, "decidedBy": None, "decisionNote": "",
+            "decidedAt": None, "appliedAt": None,
+        })
+        result = await db.timesheets.insert_one(doc)
+        record_id = result.inserted_id
+
+    saved = await db.timesheets.find_one({"_id": record_id})
+    return _serialize(saved)
+
+
 @user_router.post("/my/recall")
 async def recall_my_timesheet(
     weekStart: str = Query(...),
