@@ -2,7 +2,18 @@ from pydantic import BaseModel
 from typing import Optional, Literal, List
 
 
+# What HR may stamp when approving — the full set, because HR is also the
+# one who declares holidays and approves leave, so they can legitimately
+# resolve a day either way.
 AttendanceTypeLiteral = Literal["OFFICE", "WFH", "LEAVE", "HOLIDAY"]
+
+# What an EMPLOYEE may ask for. Deliberately narrower: a leave day comes from
+# an approved leave request and a holiday from the HR calendar, so allowing
+# either here would let someone rewrite a working day into one and bypass the
+# leave balance and the holiday list, leaving attendance disagreeing with
+# both. Historical requests already stored LEAVE; reading those is unaffected,
+# since approval reads the stored value rather than re-validating it.
+RequestableAttendanceTypeLiteral = Literal["OFFICE", "WFH"]
 
 
 class CorrectionRequestCreate(BaseModel):
@@ -18,7 +29,7 @@ class CorrectionRequestCreate(BaseModel):
     requestedDate: Optional[str] = None            # YYYY-MM-DD
     requestedCheckIn: Optional[str] = None         # ISO 8601
     requestedCheckOut: Optional[str] = None        # ISO 8601
-    requestedAttendanceType: Optional[AttendanceTypeLiteral] = None
+    requestedAttendanceType: Optional[RequestableAttendanceTypeLiteral] = None
     requestedWorkNotes: Optional[str] = None
 
 
