@@ -6,6 +6,8 @@ from bson.errors import InvalidId
 from datetime import datetime, timezone
 from typing import Optional
 
+from pydantic import BaseModel
+
 from database import db
 from utils.dependencies import (
     get_current_user,
@@ -28,6 +30,26 @@ user_router = APIRouter()
 hr_router = APIRouter()
 
 
+async def _with_department(p: dict) -> dict:
+    """Attach the department's name so the client can print it.
+
+    Looked up per project rather than joined: there are a handful of
+    projects and departments change rarely, so a second query costs less
+    than the machinery to avoid it.
+    """
+    dept_id = p.get("departmentId")
+    if dept_id:
+        try:
+            d = await db.departments.find_one(
+                {"_id": ObjectId(str(dept_id))}, {"name": 1}
+            )
+            if d:
+                p["_departmentName"] = d.get("name")
+        except (InvalidId, TypeError):
+            pass
+    return p
+
+
 def _serialize(p: dict, roster: Optional[dict] = None) -> dict:
     """`managerIds`/`memberIds` come from the membership collection, not the
     project doc — the doc no longer stores them."""
@@ -38,6 +60,9 @@ def _serialize(p: dict, roster: Optional[dict] = None) -> dict:
         "code": p.get("code"),
         "description": p.get("description"),
         "departmentId": p.get("departmentId"),
+        # Resolved so the client can name it instead of printing
+        # "Assigned", which told the reader nothing.
+        "departmentName": p.get("_departmentName"),
         "managerIds": roster["managerIds"],
         # Legacy key, still read by older app builds.
         "projectManagerIds": roster["managerIds"],
@@ -45,6 +70,7 @@ def _serialize(p: dict, roster: Optional[dict] = None) -> dict:
         "status": p.get("status", "Active"),
         "startDate": p.get("startDate"),
         "endDate": p.get("endDate"),
+        "technologies": p.get("technologies") or [],
     }
 
 
@@ -129,7 +155,7 @@ async def _serialize_many(
     out = []
     for p in docs:
         pid = str(p["_id"])
-        row = _serialize(p, await pm.roster(pid))
+        row = _serialize(await _with_department(p), await pm.roster(pid))
         row["viewerIsManager"] = viewer_is_hr or pid in managed
         out.append(row)
     return out
@@ -182,7 +208,7 @@ async def get_project(
     user: dict = Depends(get_current_user_doc),
 ):
     p = await _load(id)
-    out = _serialize(p, await pm.roster(id))
+    out = _serialize(await _with_department(p), await pm.roster(id))
     out["viewerIsManager"] = (
         user.get("role") in ("HR", "CEO")
         or await pm.is_project_manager(str(user["_id"]), id)
@@ -306,6 +332,13 @@ async def project_tasks(
             "title": t.get("title"),
             "description": t.get("description", ""),
             "status": t.get("status"),
+            "phaseId": t.get("phaseId"),
+            # Not `or 1.0`: a deliberate 0% is a real value.
+            "weight": (
+                float(t["weight"])
+                if isinstance(t.get("weight"), (int, float))
+                else 0.0
+            ),
             "priority": t.get("priority", "MEDIUM"),
             "dueDate": t.get("dueDate"),
             "assigneeId": t.get("assigneeId"),
@@ -350,10 +383,38 @@ async def create_project_task(
             "Ask HR to add them to the project first.",
         )
 
+    # A new task's share of its phase. Defaults to whatever the phase has
+    # left rather than a flat 1, and is checked against the same 100%
+    # budget the update path enforces — creation was taking phases over.
+    weight = float(data.weight) if data.weight is not None else None
+    if data.phaseId:
+        siblings = [
+            float(t.get("weight") or 0)
+            async for t in db.tasks.find(
+                {"projectId": id, "phaseId": data.phaseId}, {"weight": 1}
+            )
+        ]
+        used = sum(max(0.0, w) for w in siblings)
+        if weight is None:
+            weight = round(max(0.0, 100.0 - used), 1)
+        if weight < 0:
+            raise HTTPException(400, "A weight can't be negative.")
+        if used + weight > 100.05:
+            raise HTTPException(
+                400,
+                f"That would take this phase's tasks to "
+                f"{round(used + weight, 1)}%. There's "
+                f"{round(max(0.0, 100.0 - used), 1)}% left to allocate.",
+            )
+    elif weight is None:
+        weight = 0.0
+
     now = datetime.now(timezone.utc)
     task = {
         "teamId": None,
         "projectId": id,
+        "phaseId": data.phaseId,
+        "weight": weight,
         "title": data.title,
         "description": data.description or "",
         "assigneeId": data.assigneeId,
@@ -430,8 +491,35 @@ async def update_project_task(
     task = await _load_project_task(id, taskId)
 
     update: dict = {"updatedAt": datetime.now(timezone.utc)}
+    # A task's weight is a percentage of its phase, so the phase's tasks
+    # share a budget of 100 just as the project's phases do.
+    if data.weight is not None:
+        phase_id = (
+            data.phaseId if data.phaseId is not None else task.get("phaseId")
+        )
+        if phase_id:
+            siblings = [
+                float(t.get("weight") or 0)
+                async for t in db.tasks.find(
+                    {"projectId": id, "phaseId": phase_id,
+                     "_id": {"$ne": task["_id"]}},
+                    {"weight": 1},
+                )
+            ]
+            used = sum(max(0.0, w) for w in siblings)
+            if data.weight < 0:
+                raise HTTPException(400, "A weight can't be negative.")
+            if used + float(data.weight) > 100.05:
+                raise HTTPException(
+                    400,
+                    f"That would take this phase's tasks to "
+                    f"{round(used + float(data.weight), 1)}%. There's "
+                    f"{round(max(0.0, 100.0 - used), 1)}% left to allocate.",
+                )
+
     for field in ("title", "description", "priority", "dueDate",
-                  "reminderIntervalMinutes", "attachments"):
+                  "reminderIntervalMinutes", "attachments", "phaseId",
+                  "weight"):
         v = getattr(data, field)
         if v is not None:
             update[field] = v
@@ -520,6 +608,68 @@ async def delete_project_task(
 
 
 # ================= ATTENDANCE =================
+class TechnologiesUpdate(BaseModel):
+    technologies: list[str]
+
+
+@user_router.put("/{id}/technologies")
+async def set_technologies(
+    id: str,
+    data: TechnologiesUpdate,
+    user: dict = Depends(get_current_user_doc),
+):
+    """Set the project's stack tags.
+
+    On the member-facing router rather than the HR one: the people who know
+    what a project is built with are the ones building it, and the bar is the
+    same as assigning a task. HR and the CEO can edit any project.
+
+    Tags are trimmed, de-duplicated case-insensitively (keeping the first
+    spelling, so "React" doesn't gain a second entry beside "react") and
+    capped — this is a label row, not a description.
+    """
+    project = await db.projects.find_one({"_id": _oid(id)})
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    user_id = str(user["_id"])
+    allowed = (
+        user.get("role") in ("HR", "CEO")
+        or await pm.is_project_manager(user_id, id)
+    )
+    if not allowed:
+        raise HTTPException(
+            403, "Only this project's managers can change its technologies."
+        )
+
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for raw in data.technologies:
+        tag = " ".join(str(raw).split())[:40]
+        if not tag or tag.lower() in seen:
+            continue
+        seen.add(tag.lower())
+        cleaned.append(tag)
+        if len(cleaned) >= 30:
+            break
+
+    await db.projects.update_one(
+        {"_id": _oid(id)},
+        {"$set": {
+            "technologies": cleaned,
+            "updatedAt": datetime.now(timezone.utc),
+        }},
+    )
+    await log_audit(
+        actor_id=user_id,
+        action="project.technologies",
+        entity_type="projects",
+        entity_id=id,
+        after={"technologies": cleaned},
+    )
+    return {"technologies": cleaned}
+
+
 @user_router.get("/{id}/attendance")
 async def project_attendance(
     id: str,
@@ -591,7 +741,7 @@ async def hr_get_project(
     _hr: dict = Depends(require_hr),
 ):
     p = await _load(id)
-    return _serialize(p, await pm.roster(id))
+    return _serialize(await _with_department(p), await pm.roster(id))
 
 
 @hr_router.post("")
@@ -620,6 +770,7 @@ async def create_project(
         "status": data.status or "Active",
         "startDate": data.startDate,
         "endDate": data.endDate,
+        "technologies": data.technologies or [],
         "createdAt": now,
         "updatedAt": now,
     }
@@ -672,7 +823,7 @@ async def update_project(
     update: dict = {"updatedAt": datetime.now(timezone.utc)}
     for field in (
         "name", "description", "departmentId",
-        "status", "startDate", "endDate",
+        "status", "startDate", "endDate", "technologies",
     ):
         v = getattr(data, field)
         if v is not None:

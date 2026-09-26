@@ -7,6 +7,14 @@ TaskStatus = Literal["PENDING", "ONGOING", "COMPLETED"]
 
 
 class TaskCreate(BaseModel):
+    phaseId: Optional[str] = None
+    # How much of its phase this task represents, as a percentage. Counting
+    # tasks equally makes "write the README" worth as much as "install 40
+    # cameras", which is how a progress bar ends up lying about a project.
+    #
+    # None means "whatever the phase has left" — the route works that out,
+    # so it can't be defaulted here.
+    weight: Optional[float] = None
     title: str
     description: Optional[str] = ""
     assigneeId: str
@@ -21,6 +29,9 @@ class TaskCreate(BaseModel):
 
 
 class TaskUpdate(BaseModel):
+    # Which phase this task belongs to; null detaches it from every phase.
+    phaseId: Optional[str] = None
+    weight: Optional[float] = None
     title: Optional[str] = None
     description: Optional[str] = None
     assigneeId: Optional[str] = None

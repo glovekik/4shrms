@@ -403,3 +403,11 @@ async def create_indexes():
     # on `expiresAt` (EMAIL_LOG_TTL_DAYS) so the collection can't grow
     # without bound.
     await db.email_log.create_index("expiresAt", expireAfterSeconds=0)
+
+    # ---- Project phases and meetings ------------------------------------
+    # Both are always read scoped to one project, in display/date order.
+    await db.project_phases.create_index([("projectId", 1), ("order", 1)])
+    await db.project_meetings.create_index([("projectId", 1), ("date", -1)])
+    # Tasks are grouped by phase on the board; without this every phase
+    # rollup is a full scan of the project's tasks.
+    await db.tasks.create_index([("projectId", 1), ("phaseId", 1)])

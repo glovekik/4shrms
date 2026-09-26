@@ -74,6 +74,8 @@ from routes.dashboard import router as dashboard_router
 from routes.chat_groups import router as chat_groups_router
 from routes.org import router as org_router
 from routes.project_variables import router as project_variables_router
+from routes.project_phases import router as project_phases_router
+from routes.project_meetings import router as project_meetings_router
 from routes.projects import (
     user_router as projects_user_router,
     hr_router as projects_hr_router,
@@ -712,6 +714,20 @@ app.include_router(
 # Project Variables — reusable snippets, permissioned per file.
 app.include_router(
     project_variables_router,
+    prefix="/projects",
+    tags=["Projects"],
+)
+
+# Phases group tasks into stages and carry the project's progress.
+app.include_router(
+    project_phases_router,
+    prefix="/projects",
+    tags=["Projects"],
+)
+
+# Meeting notes — what was discussed, decided, and who owes what.
+app.include_router(
+    project_meetings_router,
     prefix="/projects",
     tags=["Projects"],
 )

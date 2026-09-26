@@ -34,6 +34,10 @@ class ProjectCreate(_ManagerAlias):
     status: Optional[ProjectStatus] = "Active"
     startDate: Optional[str] = None  # YYYY-MM-DD
     endDate: Optional[str] = None
+    # Free-form stack tags ("FastAPI", "React Native"). Not a controlled
+    # vocabulary on purpose: every project brings something the list wouldn't
+    # have had, and a wrong dropdown here just means the tag goes unrecorded.
+    technologies: Optional[list[str]] = None
 
 
 class ProjectUpdate(_ManagerAlias):
@@ -43,5 +47,6 @@ class ProjectUpdate(_ManagerAlias):
     managerIds: Optional[list[str]] = None
     memberIds: Optional[list[str]] = None
     status: Optional[ProjectStatus] = None
+    technologies: Optional[list[str]] = None
     startDate: Optional[str] = None
     endDate: Optional[str] = None
