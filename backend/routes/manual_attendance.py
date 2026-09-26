@@ -94,16 +94,39 @@ async def _user_basics(user_ids) -> dict:
 
 
 def _parse_iso(value: str, field: str) -> datetime:
-    s = value
-    if isinstance(s, str) and s.endswith("Z"):
-        s = s[:-1] + "+00:00"
+    """A typed check-in/out -> IST wall-clock, naive — the same shape every
+    other attendance time in the database has.
+
+    This used to return a timezone-AWARE UTC datetime, which approval then
+    copied straight onto the attendance row. Every other writer stores IST
+    wall-clock with no tzinfo, and the whole app reads the column that way,
+    so an approved manual entry for 9:30 AM was displayed as 4:00 AM — the
+    5:30 offset applied twice over. Times were also being compared against
+    naive ones elsewhere, which raises TypeError.
+    """
+    from utils.ist import parse_wallclock_to_ist_naive
     try:
-        dt = datetime.fromisoformat(s)
+        dt = parse_wallclock_to_ist_naive(value)
     except (TypeError, ValueError):
         raise HTTPException(400, f"Invalid {field} (ISO 8601 required)")
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+    if dt is None:
+        raise HTTPException(400, f"Invalid {field} (ISO 8601 required)")
     return dt
+
+
+
+def _classified(check_in, check_out) -> dict:
+    """status / hoursWorked / overtime / isLate for an approved manual day."""
+    if check_in and check_out:
+        from utils.attendance_rules import classify_on_checkout
+        c = classify_on_checkout(check_in, check_out)
+        return {
+            "status": c["status"],
+            "hoursWorked": c["hoursWorked"],
+            "overtimeHours": c["overtimeHours"],
+            "isLate": c["isLate"],
+        }
+    return {"status": "CHECKED_IN" if check_in else "ABSENT"}
 
 
 # ================= EMPLOYEE: SUBMIT =================
@@ -374,9 +397,13 @@ async def _decide(
                 # Preserve the requested type (OFFICE/WFH/…); the manual origin
                 # is still recorded via autoApprovedFromRequest + manualRequestId.
                 "attendanceType": r.get("attendanceType") or "OFFICE",
-                "status": (
-                    "COMPLETED" if r.get("checkOut") else "CHECKED_IN"
-                ),
+                # Run the same rules the live check-out path uses, so an
+                # approved manual day carries hours, overtime and a status
+                # the UI recognises. It previously went in with the legacy
+                # "COMPLETED" string and no hoursWorked at all, so the day
+                # showed up on the register as a blank — which is what the
+                # employee filed the request to avoid.
+                **_classified(r.get("checkIn"), r.get("checkOut")),
                 "checkIn": r.get("checkIn"),
                 "checkOut": r.get("checkOut"),
                 "workNotes": r.get("reason", ""),

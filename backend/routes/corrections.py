@@ -150,10 +150,19 @@ def _serialize(
 
 # ================= HELPERS =================
 def _parse_iso(value: str, field: str) -> datetime:
-    # Requested check-in/out are attendance times → store as IST wall-clock.
-    from utils.ist import parse_client_to_ist_naive
+    # A requested check-in/out is a time the employee TYPED on the correction
+    # form — "I actually left at 8:15 PM" means 8:15 PM in the office, not
+    # 8:15 PM wherever their laptop thinks it is. Parsing it as UTC added
+    # 5:30 to every typed time on any device not set to IST (a desktop on
+    # UTC, an emulator, someone travelling): 20:15 was stored as 01:45 the
+    # next morning, which then read back as a 16-hour day.
+    #
+    # The wall-clock parser still honours an explicit offset, so app builds
+    # already in the field — which send toISOString() with a Z — keep the
+    # behaviour they have today.
+    from utils.ist import parse_wallclock_to_ist_naive
     try:
-        return parse_client_to_ist_naive(value)
+        return parse_wallclock_to_ist_naive(value)
     except (TypeError, ValueError):
         raise HTTPException(
             400,
@@ -409,6 +418,20 @@ async def create_correction_request(
         _parse_iso(data.requestedCheckOut, "requestedCheckOut")
         if data.requestedCheckOut else None
     )
+    # Compare against the row's existing times for whichever side the
+    # employee didn't change — correcting only the check-out is the normal
+    # case, and an AM/PM slip there is exactly what produces a day that ends
+    # before it starts. Approval re-checks this on the merged values; doing
+    # it here too means they find out while the form is still open.
+    against_in = requested_check_in or attendance.get("checkIn")
+    against_out = requested_check_out or attendance.get("checkOut")
+    if against_in and against_out and against_out <= against_in:
+        raise HTTPException(
+            400,
+            f"Check-out ({against_out.strftime('%I:%M %p')}) has to be after "
+            f"check-in ({against_in.strftime('%I:%M %p')}).",
+        )
+
     if (
         requested_check_in
         and requested_check_out
@@ -649,6 +672,27 @@ async def _decide_correction_internal(
             raise HTTPException(404, "Attendance record no longer exists")
         merged_in = att_updates.get("checkIn", existing_att.get("checkIn"))
         merged_out = att_updates.get("checkOut", existing_att.get("checkOut"))
+
+        # Reject a day that ends before it starts. The two submit paths
+        # already compare a requested check-in against a requested check-out,
+        # but the common correction supplies only one of the two — "I left at
+        # 6, not 4" — and there was nothing to compare it against. The
+        # resulting negative span is clamped to 0.0 by hours_between(), so
+        # approving a mistyped AM/PM silently turned a full working day into
+        # a 0-hour HALF_DAY with no warning to anyone.
+        #
+        # This sits before the PENDING→APPROVED claim below, so a rejected
+        # correction stays pending and can be fixed and re-approved rather
+        # than being burnt.
+        if merged_in and merged_out and merged_out <= merged_in:
+            raise HTTPException(
+                400,
+                "That would put the check-out ("
+                f"{merged_out.strftime('%d %b %I:%M %p')}) at or before the "
+                f"check-in ({merged_in.strftime('%d %b %I:%M %p')}). "
+                "Correct the time on the request, or override it here.",
+            )
+
         if merged_in and merged_out:
             classification = classify_on_checkout(merged_in, merged_out)
             att_updates["status"] = classification["status"]

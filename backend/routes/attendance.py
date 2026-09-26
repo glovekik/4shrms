@@ -13,7 +13,12 @@ from bson import ObjectId
 from bson.errors import InvalidId
 
 from database import db
-from utils.ist import now_ist_naive, parse_client_to_ist_naive, iso_naive
+from utils.ist import (
+    now_ist_naive,
+    parse_client_to_ist_naive,
+    parse_wallclock_to_ist_naive,
+    iso_naive,
+)
 from utils.notify import notify_user
 
 from utils.dependencies import (
@@ -661,6 +666,16 @@ async def get_history(
                 "autoClosedByCron",
                 False,
             ),
+
+            # Why this row's times differ from what was clocked. Stamped on
+            # approval and already shown on HR's register; without it here
+            # the employee saw their own check-out silently change with no
+            # explanation of what had been approved or by when.
+            "correctionReason":
+            item.get("correctionReason"),
+
+            "correctionApprovedAt":
+            iso_naive(item.get("correctionApprovedAt")),
         })
 
     return records
@@ -767,7 +782,7 @@ async def update_attendance(
 
         try:
 
-            update_data["checkIn"] = parse_client_to_ist_naive(data.checkIn)
+            update_data["checkIn"] = parse_wallclock_to_ist_naive(data.checkIn)
 
         except (TypeError, ValueError):
 
@@ -780,7 +795,7 @@ async def update_attendance(
 
         try:
 
-            update_data["checkOut"] = parse_client_to_ist_naive(data.checkOut)
+            update_data["checkOut"] = parse_wallclock_to_ist_naive(data.checkOut)
 
         except (TypeError, ValueError):
 
@@ -801,10 +816,37 @@ async def update_attendance(
         existing.get("checkOut"),
     )
 
+    # A day that ends before it starts is a mistyped AM/PM, not a night
+    # shift — hours_between() clamps the negative span to 0.0, so approving
+    # it silently wipes out the day's hours instead of failing.
+    if (
+        final_check_in
+        and final_check_out
+        and final_check_out <= final_check_in
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Check-out ({final_check_out.strftime('%I:%M %p')}) has to "
+                f"be after check-in ({final_check_in.strftime('%I:%M %p')})."
+            ),
+        )
+
     if final_check_in and final_check_out:
 
-        update_data["status"] = \
-            "COMPLETED"
+        # Run the same rules the live check-out path uses. This used to set
+        # status to the legacy "COMPLETED" string the UI doesn't recognise
+        # and leave hoursWorked untouched — so HR could fix a check-out from
+        # 4 PM to 7 PM and the row would keep reporting the old hours to
+        # payroll and to every report built on them.
+        from utils.attendance_rules import classify_on_checkout
+        classification = classify_on_checkout(
+            final_check_in, final_check_out,
+        )
+        update_data["status"] = classification["status"]
+        update_data["hoursWorked"] = classification["hoursWorked"]
+        update_data["overtimeHours"] = classification["overtimeHours"]
+        update_data["isLate"] = classification["isLate"]
 
     elif final_check_in:
 
@@ -889,7 +931,7 @@ async def manual_attendance(
 
     if data.checkIn:
         try:
-            parsed_in = parse_client_to_ist_naive(data.checkIn)
+            parsed_in = parse_wallclock_to_ist_naive(data.checkIn)
         except (TypeError, ValueError):
             raise HTTPException(
                 400,
@@ -898,7 +940,7 @@ async def manual_attendance(
 
     if data.checkOut:
         try:
-            parsed_out = parse_client_to_ist_naive(data.checkOut)
+            parsed_out = parse_wallclock_to_ist_naive(data.checkOut)
         except (TypeError, ValueError):
             raise HTTPException(
                 400,
@@ -929,8 +971,32 @@ async def manual_attendance(
         existing.get("checkOut") if existing else None
     )
 
+    # The guard above only fires when BOTH times came in on this request.
+    # Editing just one side of a day that already has a row has to be checked
+    # against what the row already holds, or a single mistyped field still
+    # produces a day that ends before it starts — which hours_between()
+    # clamps to 0.0 rather than rejecting.
+    if final_in and final_out and final_out <= final_in:
+        raise HTTPException(
+            400,
+            f"Check-out ({final_out.strftime('%I:%M %p')}) has to be after "
+            f"check-in ({final_in.strftime('%I:%M %p')}).",
+        )
+
+    # Hours, overtime and lateness come from the same rules the live
+    # check-out path uses. This route used to write the legacy "COMPLETED"
+    # status and no hoursWorked at all, so a day HR filled in by hand showed
+    # up on the register and in payroll as zero hours worked.
+    computed: dict = {}
     if final_in and final_out:
-        status = "COMPLETED"
+        from utils.attendance_rules import classify_on_checkout
+        c = classify_on_checkout(final_in, final_out)
+        status = c["status"]
+        computed = {
+            "hoursWorked": c["hoursWorked"],
+            "overtimeHours": c["overtimeHours"],
+            "isLate": c["isLate"],
+        }
     elif final_in:
         status = "CHECKED_IN"
     else:
@@ -949,6 +1015,7 @@ async def manual_attendance(
         "workNotes": final_notes,
         "status": status,
         "updatedAt": now,
+        **computed,
     }
 
     # HR/a manager can supply the times but usually can't say what the person
