@@ -52,8 +52,8 @@ EM_BG = (253, 243, 243)
 EM_RED = (192, 57, 43)
 
 ADDRESS_LINES = [
-    "1-1-565/307, Golconda X Road, Bakaram,",
-    "Musheerabad (ND), Hyderabad - 500020, Telangana",
+    "6-3-1089/B/2/1, S.V's Srikar Heights, 2nd Floor,",
+    "Gulmohar Avenue, Somajiguda, Hyderabad - 500082, Telangana",
 ]
 
 

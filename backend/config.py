@@ -88,8 +88,8 @@ COMPANY_NAME = os.getenv(
 # `or` (not a getenv default) so an env that sets COMPANY_ADDRESS to an empty
 # string still falls back to the real address instead of printing a blank line.
 COMPANY_ADDRESS = os.getenv("COMPANY_ADDRESS", "").strip() or (
-    "1-1-565/307, Golconda X Road, Bakaram, Musheerabad (ND), "
-    "Hyderabad - 500020, Telangana"
+    "6-3-1089/B/2/1, S.V's Srikar Heights, 2nd Floor, "
+    "Gulmohar Avenue, Somajiguda, Hyderabad - 500082, Telangana"
 )
 # Local path to a logo image (PNG/JPG). Defaults to the bundled brand logo
 # in backend/assets so payslips/letters carry the logo even without an env
